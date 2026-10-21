@@ -19,10 +19,10 @@ public partial class App : Application
         {
             desktop.MainWindow = new MainWindow
             {
-                DataContext = new MainViewModel(),
+                DataContext = new MainWindowViewModel(), // <-- Ставим нашу модель с ЧПУ
             };
-        }
 
-        base.OnFrameworkInitializationCompleted();
+            base.OnFrameworkInitializationCompleted();
+        }
     }
 }
