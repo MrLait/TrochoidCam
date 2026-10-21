@@ -3,45 +3,92 @@
       xmlns:vm="using:KompasTrochoidCam.ViewModels"
         x:Class="KompasTrochoidCam.Views.GCodeWindow"
         x:DataType="vm:GCodeWindowViewModel"
-        Title="Интерактивный 3D Визуализатор iMachining"
-        Width="1000" Height="700" WindowStartupLocation="CenterOwner">
+        Title="Интерактивный 3D Симулятор ЧПУ iMachining"
+        Width="1100" Height="750" WindowStartupLocation="CenterOwner">
 
   <Grid ColumnDefinitions="350, *">
-    <!-- Левая панель: Интерактивный список G-кода с салатовой подсветкой -->
+    <!-- Левая панель: Интерактивный список G-кода -->
     <Grid Grid.Column="0" RowDefinitions="*, Auto" Margin="10">
-
-      <!-- Заменили TextBox на ListBox с привязкой к массиву строк -->
       <ListBox Grid.Row="0"
                Name="GCodeLinesList"
                ItemsSource="{Binding GCodeLines}"
                SelectedIndex="{Binding SelectedLineIndex, Mode=TwoWay}"
-               FontFamily="Consolas"
-               FontSize="12"
+               FontFamily="Consolas" FontSize="12"
                ScrollViewer.VerticalScrollBarVisibility="Auto">
-
-        <!-- Задаем стиль: перекрашиваем выделенную строку в салатовый цвет -->
         <ListBox.Styles>
           <Style Selector="ListBoxItem:selected /template/ ContentPresenter">
             <Setter Property="Background" Value="#A2FF00"/>
-            <!-- Сочный салатовый фон -->
             <Setter Property="Foreground" Value="Black"/>
-            <!-- Черный текст на салатовом фоне -->
           </Style>
         </ListBox.Styles>
       </ListBox>
-
       <Button Grid.Row="1" Content="Копировать в буфер" Command="{Binding CopyCommand}" HorizontalAlignment="Stretch" Margin="0,10,0,0" Height="35" HorizontalContentAlignment="Center"/>
     </Grid>
 
-    <!-- Правая панель: Интерактивный 3D-Холст остается без изменений -->
-    <Border Grid.Column="1" Margin="10" Background="#111111" CornerRadius="5">
-      <Grid>
-        <Canvas Name="GCodeCanvas3D" Background="Transparent" ClipToBounds="True" PointerPressed="Canvas_PointerPressed" PointerMoved="Canvas_PointerMoved" PointerReleased="Canvas_PointerReleased" PointerWheelChanged="Canvas_PointerWheelChanged"/>
-        <StackPanel Margin="15" VerticalAlignment="Top" HorizontalAlignment="Left" Spacing="5">
-          <TextBlock Text="3D Визуализация трохоиды" Foreground="SpringGreen" FontSize="14" FontWeight="Bold"/>
-          <TextBlock Text="Зажмите ЛКМ для вращения сцены" Foreground="#666666" FontSize="11"/>
-        </StackPanel>
-      </Grid>
-    </Border>
+    <!-- Правая панель: 3D-Холст + Панель Управления Плеером -->
+    <Grid Grid.Column="1" RowDefinitions="*, Auto" Margin="10">
+      <Border Grid.Row="0" Background="#2B2B2B" CornerRadius="5">
+        <Grid>
+          <Canvas Name="GCodeCanvas3D" Background="Transparent" ClipToBounds="True" PointerPressed="Canvas_PointerPressed" PointerMoved="Canvas_PointerMoved" PointerReleased="Canvas_PointerReleased" PointerWheelChanged="Canvas_PointerWheelChanged"/>
+
+          <!-- Информационная CAM-панель -->
+          <StackPanel Margin="15" VerticalAlignment="Top" HorizontalAlignment="Left" Spacing="5">
+            <TextBlock Text="3D Визуализация трохоиды iMachining" Foreground="SpringGreen" FontSize="14" FontWeight="Bold"/>
+            <Border Background="#22FFFFFF" Padding="10" CornerRadius="5" Width="280">
+              <StackPanel Spacing="4">
+                <Grid ColumnDefinitions="*, *">
+                  <TextBlock Grid.Column="0" Text="Габариты X:" Foreground="#AAAAAA" FontSize="11"/>
+                  <TextBlock Grid.Column="1" Text="{Binding BoundsX}" Foreground="White" FontSize="11" FontWeight="Bold"/>
+                </Grid>
+                <Grid ColumnDefinitions="*, *">
+                  <TextBlock Grid.Column="0" Text="Габариты Y:" Foreground="#AAAAAA" FontSize="11"/>
+                  <TextBlock Grid.Column="1" Text="{Binding BoundsY}" Foreground="White" FontSize="11" FontWeight="Bold"/>
+                </Grid>
+                <Grid ColumnDefinitions="*, *">
+                  <TextBlock Grid.Column="0" Text="Глубина Z:" Foreground="#AAAAAA" FontSize="11"/>
+                  <TextBlock Grid.Column="1" Text="{Binding BoundsZ}" Foreground="White" FontSize="11" FontWeight="Bold"/>
+                </Grid>
+                <Separator Background="#44FFFFFF" Margin="0,5"/>
+                <Grid ColumnDefinitions="*, *">
+                  <TextBlock Grid.Column="0" Text="Время обработки:" Foreground="SpringGreen" FontSize="11" FontWeight="Bold"/>
+                  <TextBlock Grid.Column="1" Text="{Binding EstimatedTime}" Foreground="SpringGreen" FontSize="11" FontWeight="Bold"/>
+                </Grid>
+              </StackPanel>
+            </Border>
+          </StackPanel>
+        </Grid>
+      </Border>
+
+      <!-- ПАНЕЛЬ КНОПОК ПРОИГРЫВАТЕЛЯ (КАК В АУДИОПЛЕЕРЕ) -->
+      <Border Grid.Row="1" Background="#222222" Margin="0,10,0,0" Padding="10" CornerRadius="5">
+        <Grid ColumnDefinitions="Auto, *, Auto">
+          <!-- Кнопки Навигации Плеера -->
+          <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+            <Button Content="⏮ Стоп" Click="BtnStop_Click" Width="75" HorizontalContentAlignment="Center" Background="#E53935" Foreground="White"/>
+            <Button Content="⏸ Пауза" Click="BtnPause_Click" Width="80" HorizontalContentAlignment="Center" Background="#FFB300" Foreground="Black"/>
+            <Button Content="▶ Пуск" Click="BtnPlay_Click" Width="75" HorizontalContentAlignment="Center" Background="#4CAF50" Foreground="White"/>
+          </StackPanel>
+
+          <!-- Шаговые Кнопки (Покадрово) -->
+          <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Center" Spacing="10">
+            <Button Content="◀ Кадр Назад" Click="BtnStepBack_Click" Width="110" HorizontalContentAlignment="Center"/>
+            <TextBlock Text="{Binding SimulationProgress}" Foreground="White" VerticalAlignment="Center" FontWeight="Bold" Margin="5,0"/>
+            <Button Content="Кадр Вперед ▶" Click="BtnStepForward_Click" Width="110" HorizontalContentAlignment="Center"/>
+          </StackPanel>
+
+          <!-- Выбор Коэффициента Ускорения -->
+          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8">
+            <TextBlock Text="Скорость:" Foreground="White" VerticalAlignment="Center" FontSize="12"/>
+            <ComboBox Name="ComboSpeed" Width="85" SelectedIndex="0" SelectionChanged="ComboSpeed_SelectionChanged">
+              <ComboBoxItem Content="1x"/>
+              <ComboBoxItem Content="2x"/>
+              <ComboBoxItem Content="5x"/>
+              <ComboBoxItem Content="10x"/>
+              <ComboBoxItem Content="25x"/>
+            </ComboBox>
+          </StackPanel>
+        </Grid>
+      </Border>
+    </Grid>
   </Grid>
 </Window>

@@ -13,6 +13,23 @@ namespace KompasTrochoidCam.ViewModels
         // Хранилище для полного сырого текста (нужно для буфера обмена)
         private string _rawGCodeText = string.Empty;
 
+        [ObservableProperty]
+        private string _boundsX = "X0.000 : X0.000";
+
+        [ObservableProperty]
+        private string _boundsY = "Y0.000 : Y0.000";
+
+        [ObservableProperty]
+        private string _boundsZ = "Z0.000 : Z0.000";
+
+        [ObservableProperty]
+        private string _estimatedTime = "00:00:00";
+
+        [ObservableProperty]
+        private string _simulationProgress = "Кадр: 0 / 0";
+
+
+
         public string GCodeText
         {
             get => _rawGCodeText;
