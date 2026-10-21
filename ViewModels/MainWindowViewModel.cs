@@ -24,9 +24,11 @@ namespace KompasTrochoidCam.ViewModels
         {
             try
             {
+                AvailablePosts.Clear();
+
+                // Читаем папку POSTPROCESSORS прямо там, где запустилась программа
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string rootDir = Path.GetFullPath(Path.Combine(baseDir, @"..\..\..\..\"));
-                string postPath = Path.Combine(rootDir, "POSTPROCESSORS");
+                string postPath = Path.Combine(baseDir, "POSTPROCESSORS");
 
                 if (Directory.Exists(postPath))
                 {
@@ -36,12 +38,18 @@ namespace KompasTrochoidCam.ViewModels
                         AvailablePosts.Add(Path.GetFileName(file));
                     }
                 }
+                else
+                {
+                    // Если папки вдруг нет, создадим её пустую, чтобы не было сбоев
+                    Directory.CreateDirectory(postPath);
+                }
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"Ошибка чтения папки POSTPROCESSORS: {ex.Message}");
             }
         }
+
 
 
         // Автоматически генерируемые свойства через генераторы кода (CommunityToolkit)
