@@ -17,7 +17,32 @@ namespace KompasTrochoidCam.ViewModels
         public MainWindowViewModel()
         {
             _kompasService = new KompasService();
+            LoadPostprocessors(); // Загружаем станки при старте программы
         }
+
+        private void LoadPostprocessors()
+        {
+            try
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+                string rootDir = Path.GetFullPath(Path.Combine(baseDir, @"..\..\..\..\"));
+                string postPath = Path.Combine(rootDir, "POSTPROCESSORS");
+
+                if (Directory.Exists(postPath))
+                {
+                    var files = Directory.GetFiles(postPath, "*.*");
+                    foreach (var file in files)
+                    {
+                        AvailablePosts.Add(Path.GetFileName(file));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Ошибка чтения папки POSTPROCESSORS: {ex.Message}");
+            }
+        }
+
 
         // Автоматически генерируемые свойства через генераторы кода (CommunityToolkit)
         [ObservableProperty]
@@ -37,6 +62,17 @@ namespace KompasTrochoidCam.ViewModels
 
         [ObservableProperty]
         private string _feedRate = "400";
+
+        [ObservableProperty]
+        private System.Collections.ObjectModel.ObservableCollection<string> _availablePosts = new();
+
+        [ObservableProperty]
+        [NotifyPropertyChangedFor(nameof(IsPostSelected))] // Автоматически обновляет доступность кнопки
+        private string? _selectedPost;
+
+        // Свойство проверки: активна ли фиолетовая кнопка
+        public bool IsPostSelected => !string.IsNullOrEmpty(SelectedPost);
+
 
         // Команда для кнопки "Подключиться к КОМПАС"
         [RelayCommand]
@@ -204,5 +240,55 @@ namespace KompasTrochoidCam.ViewModels
             }
             return cleanBlock.ToString();
         }
+
+        // Команда для кнопки "Открыть сторонний G-код"
+        [RelayCommand]
+        private async System.Threading.Tasks.Task OpenGCodeFile()
+        {
+            if (string.IsNullOrEmpty(SelectedPost)) return;
+
+            if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop)
+            {
+                var topLevel = Avalonia.Controls.TopLevel.GetTopLevel(desktop.MainWindow);
+                if (topLevel == null) return;
+
+                // Сразу открываем выбор управляющей программы под выбранный станок
+                var options = new Avalonia.Platform.Storage.FilePickerOpenOptions
+                {
+                    Title = $"Импорт файла через постпроцессор: {SelectedPost}",
+                    AllowMultiple = false,
+                    FileTypeFilter = new[]
+                    {
+                        new Avalonia.Platform.Storage.FilePickerFileType("Файлы ЧПУ")
+                        {
+                            Patterns = new[] { "*.nc", "*.ngc", "*.tap", "*.gcode" }
+                        }
+                    }
+                };
+
+                var files = await topLevel.StorageProvider.OpenFilePickerAsync(options);
+
+                if (files != null && files.Count > 0)
+                {
+                    var selectedFile = files[0];
+
+                    using var stream = await selectedFile.OpenReadAsync();
+                    using var reader = new System.IO.StreamReader(stream);
+                    string gcodeContent = await reader.ReadToEndAsync();
+
+                    var gcodeVM = new GCodeWindowViewModel { GCodeText = gcodeContent };
+                    var gcodeWindow = new Views.GCodeWindow { DataContext = gcodeVM };
+
+                    gcodeWindow.ParseAndBuildTrajectory(gcodeContent);
+                    gcodeWindow.Show();
+
+                    ConnectionStatus = $"Код {selectedFile.Name} импортирован через {SelectedPost}";
+                }
+            }
+        }
+
+
+
+
     }
 }

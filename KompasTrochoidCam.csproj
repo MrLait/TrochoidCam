@@ -12,6 +12,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <AvaloniaXaml Remove="Views\PostSelectWindow.axaml" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="Views\PostSelectWindow.axaml" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.1.4" />
     <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
@@ -25,8 +33,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Compile Update="Views\PostSelectWindow.axaml.cs">
+      <DependentUpon>PostSelectWindow.axaml</DependentUpon>
+    </Compile>
     <Compile Update="Views\GCodeWindow.axaml.cs">
       <DependentUpon>GCodeWindow.axaml</DependentUpon>
     </Compile>
   </ItemGroup>
+
+ 
+
+
 </Project>

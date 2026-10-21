@@ -1,0 +1,27 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:vm="using:KompasTrochoidCam.ViewModels"
+        x:Class="KompasTrochoidCam.Views.PostSelectWindow"
+        x:DataType="vm:PostSelectViewModel"
+        Title="Выбор постпроцессора станка"
+        Width="350" Height="180" WindowStartupLocation="CenterOwner"
+        CanResize="False">
+
+  <StackPanel Margin="20" Spacing="15">
+    <TextBlock Text="Выберите постпроцессор для импорта:" FontWeight="Bold" FontSize="13"/>
+
+    <!-- Список доступных станков -->
+    <ComboBox ItemsSource="{Binding AvailablePosts}"
+              SelectedItem="{Binding SelectedPost}"
+              HorizontalAlignment="Stretch"
+              Height="35"/>
+
+    <!-- Кнопка подтверждения -->
+    <Button Content="Подтвердить и открыть файл"
+            Command="{Binding ConfirmCommand}"
+            HorizontalAlignment="Stretch"
+            HorizontalContentAlignment="Center"
+            Background="#4CAF50" Foreground="White"
+            Height="35"/>
+  </StackPanel>
+</Window>
