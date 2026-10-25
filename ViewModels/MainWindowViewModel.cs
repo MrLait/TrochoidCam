@@ -182,6 +182,28 @@ namespace KompasTrochoidCam.ViewModels
             if (connected) RefreshGeometry();
         }
 
+        /// <summary>Открывает отчёт о последней попытке подключения (ProgID, ROT, права, HRESULT).</summary>
+        [RelayCommand]
+        private void ShowConnectDiagnostics()
+        {
+            string report = _kompasService.LastDiagnostics;
+            if (string.IsNullOrWhiteSpace(report))
+                report = "Попыток подключения ещё не было. Нажмите «Подключиться к КОМПАС», затем откройте этот отчёт снова.";
+
+            var window = new Views.ConnectDiagnosticsWindow(report);
+
+            if (Avalonia.Application.Current?.ApplicationLifetime is
+                Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop &&
+                desktop.MainWindow is { } owner)
+            {
+                _ = window.ShowDialog(owner);
+            }
+            else
+            {
+                window.Show();
+            }
+        }
+
         [RelayCommand]
         private void RefreshGeometry()
         {

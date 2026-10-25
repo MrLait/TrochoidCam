@@ -57,6 +57,8 @@
         <WrapPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right">
           <Button Classes="tool" Content="Подключиться к КОМПАС" Command="{Binding ConnectCommand}"
                   Background="#0969DA" Foreground="White"/>
+          <Button Classes="tool" Content="Диагностика" Command="{Binding ShowConnectDiagnosticsCommand}"
+                  ToolTip.Tip="Отчёт о последней попытке подключения: ProgID, объекты в ROT, права процессов, HRESULT"/>
           <Button Classes="tool" Content="Обновить геометрию" Command="{Binding RefreshGeometryCommand}"
                   Background="#1A7F37" Foreground="White"/>
           <Button Classes="tool" Content="Демо-деталь" Command="{Binding LoadDemoGeometryCommand}"/>
