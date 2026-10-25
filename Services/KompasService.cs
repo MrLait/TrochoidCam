@@ -548,6 +548,9 @@ namespace KompasTrochoidCam.Services
         /// <summary>Разброс Z, при котором грань считается горизонтальной, мм.</summary>
         private const double HorizontalTolerance = 0.05;
 
+        /// <summary>Шаг полигона при разложении кривых рёбер, мм.</summary>
+        private const double CurveStepMm = 0.2;
+
         /// <summary>Точка в пространстве детали (внутреннее представление при чтении из КОМПАС).</summary>
         private readonly struct Point3
         {
@@ -565,8 +568,8 @@ namespace KompasTrochoidCam.Services
 
         /// <summary>
         /// Читает геометрию активной детали по объектной модели API 7:
-        /// IKompasDocument3D::TopPart → IFeature7::ModelObjects(o3d_face) → IFace::Loops
-        /// → ILoop7::OrientedEdges → IEdge::Vertex / IEdge::MathCurve → IVertex::GetPoint.
+        /// TopPart → IFeature7::ModelObjects(o3d_face) → IFace::Loops
+        /// → ILoop7::OrientedEdges → IOrientedEdge7::Edge → IEdge::MathCurve.
         /// </summary>
         public PartGeometry ReadPartGeometry(out string message)
         {
@@ -576,6 +579,7 @@ namespace KompasTrochoidCam.Services
                 Source = "kompas"
             };
 
+            KompasApi7Diagnostics.Clear();
             var log = new List<string> { "=== Чтение геометрии ===" };
 
             if (_kompasApp == null)
@@ -639,6 +643,7 @@ namespace KompasTrochoidCam.Services
                 geometry.RecalculateBounds();
                 if (!geometry.IsEmpty) log.Add($"Габариты детали: {geometry.SizeText}");
 
+                AppendComLog(log);
                 AppendDiagnostics(log);
 
                 message = geometry.IsEmpty
@@ -650,6 +655,7 @@ namespace KompasTrochoidCam.Services
             catch (Exception ex)
             {
                 log.Add("Ошибка: " + DescribeException(ex));
+                AppendComLog(log);
                 AppendDiagnostics(log);
                 message = $"Ошибка чтения геометрии: {DescribeException(ex)}";
                 return geometry;
@@ -690,6 +696,15 @@ namespace KompasTrochoidCam.Services
             return topPart;
         }
 
+        private void AppendComLog(List<string> lines)
+        {
+            IReadOnlyList<string> com = KompasApi7Diagnostics.Snapshot();
+            if (com.Count == 0) return;
+
+            lines.Add("Обращения к COM-интерфейсам:");
+            foreach (string entry in com) lines.Add("  • " + entry);
+        }
+
         private void AppendDiagnostics(List<string> lines)
         {
             string text = string.Join(Environment.NewLine, lines);
@@ -698,31 +713,57 @@ namespace KompasTrochoidCam.Services
                 : LastDiagnostics + Environment.NewLine + Environment.NewLine + text;
         }
 
-        /// <summary>Объекты заданного типа у элемента дерева построения (IFeature7::ModelObjects).</summary>
+        /// <summary>
+        /// Объекты заданного типа у элемента дерева построения (IFeature7::ModelObjects).
+        /// Сначала пробуется обычное позднее связывание, затем QueryInterface к IFeature7.
+        /// </summary>
         private static List<object> GetModelObjects(object part, int objType, List<string> log)
         {
             var result = new List<object>();
 
             foreach (string member in new[] { "ModelObjects", "GetModelObjects" })
             {
-                object? raw = TryGetMember(part, member, new object?[] { objType }, log);
-                if (raw == null) raw = TryGetMember(part, member, new object?[] { (short)objType }, null);
+                object? raw = TryGetMember(part, member, new object?[] { objType }, null)
+                              ?? TryGetMember(part, member, new object?[] { (short)objType }, null);
 
-                foreach (object item in Flatten(raw))
-                {
-                    if (ReferenceEquals(item, part)) continue;
-                    result.Add(item);
-                }
-
+                AddObjects(result, raw, part);
                 if (result.Count > 0)
                 {
-                    log.Add($"{member}({objType}): {result.Count} объектов");
+                    log.Add($"{member}: {result.Count} объектов");
                     return result;
                 }
             }
 
-            log.Add("ModelObjects: коллекция объектов не получена");
+            log.Add("Прямое обращение к ModelObjects недоступно — приводим TopPart к IFeature7");
+
+            using ComDispatch? feature = KompasApi7.Cast(part, "IFeature7");
+            if (feature == null)
+            {
+                log.Add("IFeature7: " + (KompasApi7.LastError.Length > 0 ? KompasApi7.LastError : "недоступен"));
+                return result;
+            }
+
+            foreach (object type in new object[] { objType, (short)objType })
+            {
+                AddObjects(result, feature.Get("ModelObjects", type), part);
+                if (result.Count > 0)
+                {
+                    log.Add($"IFeature7.ModelObjects: {result.Count} объектов");
+                    return result;
+                }
+            }
+
+            log.Add("IFeature7.ModelObjects: коллекция пуста");
             return result;
+        }
+
+        private static void AddObjects(List<object> target, object? raw, object? owner)
+        {
+            foreach (object item in Flatten(raw))
+            {
+                if (ReferenceEquals(item, owner)) continue;
+                target.Add(item);
+            }
         }
 
         /// <summary>
@@ -735,9 +776,14 @@ namespace KompasTrochoidCam.Services
             Dictionary<string, PartEdge> edges,
             out bool hasLoops)
         {
-            var loopObjects = Flatten(TryGetMember(faceObject, "Loops", null, null)).ToList();
-            hasLoops = loopObjects.Count > 0;
-            if (loopObjects.Count == 0) return null;
+            var loopObjects = Flatten(GetMember(faceObject, "Loops", "IFace")).ToList();
+            var limitingEdges = new List<object>();
+
+            if (loopObjects.Count == 0)
+                limitingEdges = Flatten(GetMember(faceObject, "LimitingEdges", "IFace")).ToList();
+
+            hasLoops = loopObjects.Count > 0 || limitingEdges.Count > 0;
+            if (!hasLoops) return null;
 
             var face = new PartFace { Id = id, Name = $"Грань #{id}" };
             double minZ = double.MaxValue;
@@ -745,10 +791,34 @@ namespace KompasTrochoidCam.Services
             double zSum = 0;
             int zCount = 0;
 
+            var loops = new List<(List<Point3> Points, bool IsOuter)>();
+
             foreach (object loopObject in loopObjects)
             {
-                if (!TryReadLoop(loopObject, id, edges, out List<Point3> points, out bool isOuter)) continue;
+                if (TryReadLoop(loopObject, id, edges, out List<Point3> points, out bool isOuter))
+                    loops.Add((points, isOuter));
+            }
 
+            // Резерв, если циклы недоступны: ребра грани отдельным массивом.
+            if (loops.Count == 0 && limitingEdges.Count > 0)
+            {
+                var pieces = new List<List<Point3>>();
+                foreach (object edgeObject in limitingEdges)
+                {
+                    var piece = ReadEdgePoints(edgeObject);
+                    if (piece.Count >= 2)
+                    {
+                        pieces.Add(piece);
+                        RememberEdge(edges, piece, id);
+                    }
+                }
+
+                List<Point3> chained = ChainPieces(pieces);
+                if (chained.Count >= 3) loops.Add((chained, true));
+            }
+
+            foreach ((List<Point3> points, bool isOuter) in loops)
+            {
                 var flat = new List<TrochoidEngine.Point2D>(points.Count);
                 foreach (Point3 point in points)
                 {
@@ -791,69 +861,81 @@ namespace KompasTrochoidCam.Services
             out List<Point3> points,
             out bool isOuter)
         {
-            points = new List<Point3>();
-            isOuter = ToBool(TryGetMember(loopObject, "IsOuter", null, null), true);
+            isOuter = ToBool(GetMember(loopObject, "IsOuter", "ILoop7"), true);
 
-            var oriented = Flatten(TryGetMember(loopObject, "OrientedEdges", null, null)).ToList();
+            var oriented = Flatten(GetMember(loopObject, "OrientedEdges", "ILoop7")).ToList();
             bool useOriented = oriented.Count > 0;
-            if (!useOriented) oriented = Flatten(TryGetMember(loopObject, "Edges", null, null)).ToList();
+            if (!useOriented) oriented = Flatten(GetMember(loopObject, "Edges", "ILoop7")).ToList();
 
+            var pieces = new List<List<Point3>>();
             foreach (object item in oriented)
             {
-                object? edgeObject = useOriented ? (TryGetMember(item, "Edge", null, null) ?? item) : item;
+                object? edgeObject = useOriented
+                    ? (GetMember(item, "Edge", "IOrientedEdge7") ?? item)
+                    : item;
+
                 if (edgeObject == null) continue;
 
-                bool sameSense = !useOriented || ToBool(TryGetMember(item, "SameSense", null, null), true);
+                var piece = ReadEdgePoints(edgeObject);
+                if (piece.Count < 2) continue;
 
-                var edgePoints = ReadEdgePoints(edgeObject);
-                if (edgePoints.Count < 2) continue;
-
-                if (!sameSense) edgePoints.Reverse();
-
-                foreach (Point3 point in edgePoints) AppendDistinct(points, point);
-                RememberEdge(edges, edgePoints, faceId);
+                pieces.Add(piece);
+                RememberEdge(edges, piece, faceId);
             }
 
-            if (points.Count >= 3 && Distance2D(points[0], points[points.Count - 1]) < 1e-6)
-                points.RemoveAt(points.Count - 1);
-
+            points = ChainPieces(pieces);
             return points.Count >= 3;
         }
 
-        /// <summary>Точки ребра по порядку: вершины для отрезка, полигон кривой для дуги.</summary>
-        private static List<Point3> ReadEdgePoints(object edgeObject)
+        /// <summary>
+        /// Сшивает куски в один контур по близости концов: направление обхода каждой
+        /// дуги/ребра в API не гарантировано, а для построения области это критично.
+        /// </summary>
+        private static List<Point3> ChainPieces(List<List<Point3>> pieces)
         {
             var points = new List<Point3>();
 
-            bool straight = ToBool(TryGetMember(edgeObject, "IsStraight", null, null), false);
-            bool curved = ToBool(TryGetMember(edgeObject, "IsArc", null, null), false)
-                          || ToBool(TryGetMember(edgeObject, "IsCircle", null, null), false)
-                          || ToBool(TryGetMember(edgeObject, "IsEllipse", null, null), false)
-                          || ToBool(TryGetMember(edgeObject, "IsEllipseArc", null, null), false)
-                          || ToBool(TryGetMember(edgeObject, "IsNurbs", null, null), false);
-
-            if (!straight || curved)
+            foreach (List<Point3> piece in pieces)
             {
-                object? curve = TryGetMember(edgeObject, "MathCurve", null, null);
-                if (curve != null)
+                if (piece.Count < 2) continue;
+
+                if (points.Count == 0)
                 {
-                    // Шаг полигона 0.2 мм: дуги радиусом от 1 мм раскладываются достаточно точно.
-                    object? polygon = InvokeMemberSafe(curve, "CalculatePolygon", new object?[] { 0.2 });
-                    var sampled = ReadPointsArray(polygon);
+                    foreach (Point3 point in piece) AppendDistinct(points, point);
+                    continue;
+                }
 
-                    if (sampled.Count >= 2)
-                    {
-                        Point3? start = GetEdgeVertex(edgeObject, true);
-                        if (start.HasValue &&
-                            Distance(start.Value, sampled[0]) > Distance(start.Value, sampled[sampled.Count - 1]))
-                        {
-                            sampled.Reverse();
-                        }
+                Point3 tail = points[points.Count - 1];
+                bool forward = Distance2D(tail, piece[0]) <= Distance2D(tail, piece[piece.Count - 1]);
 
-                        return sampled;
-                    }
+                if (forward)
+                {
+                    foreach (Point3 point in piece) AppendDistinct(points, point);
+                }
+                else
+                {
+                    for (int i = piece.Count - 1; i >= 0; i--) AppendDistinct(points, piece[i]);
                 }
             }
+
+            if (points.Count > 1 && Distance2D(points[0], points[points.Count - 1]) < 1e-3)
+                points.RemoveAt(points.Count - 1);
+
+            return points;
+        }
+
+        /// <summary>Точки ребра по порядку: полигон кривой, при неудаче — две вершины.</summary>
+        private static List<Point3> ReadEdgePoints(object edgeObject)
+        {
+            object? curve = GetMember(edgeObject, "MathCurve", "IEdge");
+            if (curve != null)
+            {
+                object? polygon = InvokeMemberSafe(curve, "CalculatePolygon", new object?[] { CurveStepMm });
+                var sampled = ReadPointsArray(polygon);
+                if (sampled.Count >= 2) return sampled;
+            }
+
+            var points = new List<Point3>();
 
             Point3? first = GetEdgeVertex(edgeObject, true);
             Point3? last = GetEdgeVertex(edgeObject, false);
@@ -866,9 +948,8 @@ namespace KompasTrochoidCam.Services
 
         private static Point3? GetEdgeVertex(object edgeObject, bool start)
         {
-            // В разных версиях API параметр Start принимает bool либо 0/1.
-            object? vertex = TryGetMember(edgeObject, "Vertex", new object?[] { start }, null);
-            if (vertex == null) vertex = TryGetMember(edgeObject, "Vertex", new object?[] { start ? 1 : 0 }, null);
+            object? vertex = GetMember(edgeObject, "Vertex", "IEdge", new object?[] { start })
+                             ?? GetMember(edgeObject, "Vertex", "IEdge", new object?[] { start ? 1 : 0 });
 
             return GetVertexPoint(vertex);
         }
@@ -900,6 +981,7 @@ namespace KompasTrochoidCam.Services
             }
             catch
             {
+                KompasApi7Diagnostics.Report("IVertex.GetPoint: вызов недоступен");
                 return null;
             }
         }
@@ -1042,6 +1124,19 @@ namespace KompasTrochoidCam.Services
             string tail = FormattableString.Invariant($"{bx:F3},{by:F3},{bz:F3}");
 
             return forward ? head + "|" + tail : tail + "|" + head;
+        }
+
+        /// <summary>
+        /// Член объекта: сначала обычное позднее связывание, затем — по указанному
+        /// интерфейсу через QueryInterface (объекты API 7 отдают только интерфейс по умолчанию).
+        /// </summary>
+        private static object? GetMember(object? target, string member, string interfaceName, object?[]? args = null)
+        {
+            object? value = TryGetMember(target, member, args, null);
+            if (value != null || target == null) return value;
+
+            using ComDispatch? dispatch = KompasApi7.Cast(target, interfaceName);
+            return dispatch?.Get(member, args ?? Array.Empty<object?>());
         }
 
         private static object? TryGetMember(object? target, string member, object?[]? args, List<string>? log)

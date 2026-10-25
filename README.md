@@ -60,7 +60,7 @@
 | Язык, платформа | C#, .NET 10 (`net10.0-windows`), `WinExe` |
 | UI | Avalonia UI 12.1.4 (FluentTheme, шрифт Inter, `ViewLocator`) |
 | MVVM | CommunityToolkit.Mvvm 8.4.2 (`[ObservableProperty]`, `[RelayCommand]`) |
-| Интеграция с CAD | COM API КОМПАС‑3D v7, `System.Reflection` + P/Invoke `oleaut32.dll`/`ole32.dll` (CLSID по ProgID, обход ROT, диагностика) |
+| Интеграция с CAD | COM API КОМПАС‑3D v7: `System.Reflection` + P/Invoke `oleaut32.dll`/`ole32.dll` (CLSID по ProgID, обход ROT, диагностика); для интерфейсов не по умолчанию — `QueryInterface` по IID из библиотеки типов и вызов через IDispatch-слоты vtable |
 | Хранение проекта | `System.Text.Json`, файл `.tcplan` |
 | Прочее | `System.Management` 10.0.13, `AvaloniaUI.DiagnosticsSupport` (только Debug) |
 | Решение | `KompasTrochoidCam.slnx`, манифест `app.manifest` (Windows 10) |
@@ -121,6 +121,8 @@ dotnet run --project KompasTrochoidCam.csproj
 2. В TrochoidCam нажмите **«Подключиться к КОМПАС»** — после успешного подключения геометрия читается сразу.
 3. Если модель в КОМПАС изменилась, нажмите **«Обновить геометрию»** — документ перечитывается без перезапуска приложения.
 4. Если КОМПАС не запущен или документ не открыт, приложение показывает демо‑деталь и предупреждение в статусе.
+
+Строка статуса внизу окна — обычное текстовое поле: текст можно выделить мышью и скопировать (**Ctrl+C** или правая кнопка → «Копировать»), рядом есть кнопка **«Копировать»** целиком.
 
 **Если подключиться не удаётся**, нажмите **«Диагностика»** рядом с кнопкой подключения: окно покажет отчёт о последней попытке (какие ProgID зарегистрированы в COM, какие объекты есть в Running Object Table, с какими правами запущены процессы, какой HRESULT вернул `GetActiveObject`). Отчёт можно скопировать и приложить к описанию проблемы.
 
