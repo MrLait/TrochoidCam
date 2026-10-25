@@ -1121,7 +1121,7 @@ namespace KompasTrochoidCam.Services
                 double midAngle = Math.Atan2(mid.Y - cy, mid.X - cx);
 
                 // У замкнутого кругового ребра начало и конец совпадают: это полный оборот.
-                bool closed = Distance2D(edge.Start, edge.End) < 1e-3;
+                bool closed = Distance2D(first, last) < 1e-3;
                 if (closed)
                 {
                     edge.Clockwise = false;
@@ -1269,6 +1269,7 @@ namespace KompasTrochoidCam.Services
             catch { return fallback; }
         }
 
+        /// <summary>
         /// Устаревший сценарий: контур выделенной плоской грани.
         /// Оставлен для совместимости; основной путь — <see cref="ReadPartGeometry"/>.
         /// </summary>
