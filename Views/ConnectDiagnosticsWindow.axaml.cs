@@ -1,4 +1,5 @@
 using Avalonia.Controls;
+using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 
 namespace KompasTrochoidCam.Views
@@ -13,13 +14,28 @@ namespace KompasTrochoidCam.Views
 
         public ConnectDiagnosticsWindow(string report) : this()
         {
-            this.FindControl<TextBox>("ReportBox")!.Text = report;
+            var box = this.FindControl<TextBox>("ReportBox");
+            if (box != null) box.Text = report;
         }
 
         private async void CopyButton_Click(object? sender, RoutedEventArgs e)
         {
-            if (Clipboard == null) return;
-            await Clipboard.SetTextAsync(this.FindControl<TextBox>("ReportBox")?.Text ?? string.Empty);
+            // В Avalonia 12 SetTextAsync — метод расширения ClipboardExtensions
+            // из пространства имён Avalonia.Input.Platform, а не член IClipboard.
+            var clipboard = Clipboard;
+            if (clipboard == null) return;
+
+            string report = this.FindControl<TextBox>("ReportBox")?.Text ?? string.Empty;
+
+            try
+            {
+                await clipboard.SetTextAsync(report);
+                if (sender is Button button) button.Content = "Скопировано";
+            }
+            catch
+            {
+                // Буфер обмена может быть занят другим приложением — не роняем окно.
+            }
         }
 
         private void CloseButton_Click(object? sender, RoutedEventArgs e) => Close();

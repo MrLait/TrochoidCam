@@ -170,7 +170,8 @@ namespace KompasTrochoidCam.Services
                 ? "Процессы КОМПАС: " + string.Join(", ", processes)
                 : "Процессы КОМПАС: не запущены.");
 
-            log.Add($"Наше приложение: PID {Environment.ProcessId}, сессия {Process.GetCurrentProcess().SessionId}, " +
+            log.Add($"Наше приложение: PID {Environment.ProcessId}, {RuntimeInformation.ProcessArchitecture}, " +
+                    $"сессия {CurrentSessionId()}, " +
                     (Environment.IsPrivilegedProcess ? "права администратора" : "обычные права"));
 
             object? attached = null;
@@ -253,6 +254,12 @@ namespace KompasTrochoidCam.Services
                 ? $"Подключено к КОМПАС-3D · документ: {GetActiveDocName()}"
                 : "Подключено к КОМПАС-3D, но активный документ не открыт — откройте деталь .m3d и нажмите «Обновить геометрию»";
             return true;
+        }
+
+        private static int CurrentSessionId()
+        {
+            using var process = Process.GetCurrentProcess();
+            return process.SessionId;
         }
 
         private const string SelfObjectVia = "сам объект";
