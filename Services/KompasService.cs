@@ -588,18 +588,14 @@ namespace KompasTrochoidCam.Services
             }
 
             var notes = new List<string>();
+            var candidates = new List<(object Instance, string Source)>();
 
-            // 1. У coclass Application основной dispinterface — KompasObject (API 5),
-            //    поэтому уже подключённый объект приложения обычно вызывает ActiveDocument3D.
-            object? api5 = TryApi5From(_kompasApp, notes);
-            if (api5 != null)
-            {
-                _kompas5 = api5;
-                message = "API 5: " + string.Join("; ", notes);
-                return _kompas5;
-            }
+            // Уже подключённое приложение API 7: часть версий отдаёт через него и API 5.
+            if (_kompasApp != null)
+                candidates.Add((_kompasApp, "приложение из подключения"));
 
-            // 2. Отдельное подключение по ProgID API 5 (в КОМПАС v19-v22 ProgID зарегистрирован).
+            // Отдельное подключение по ProgID API 5 — штатный путь для API 5
+            // (в v19-v22 ProgID «KOMPAS.Application.5» зарегистрирован).
             foreach (string progId in new[] { "KOMPAS.Application.5", "KOMPAS.Application" })
             {
                 Guid? clsid = ResolveClsidFromProgId(progId);
@@ -612,85 +608,82 @@ namespace KompasTrochoidCam.Services
                 int hr = TryGetActiveObject(clsid.Value, out object? instance);
                 if (hr != 0 || instance == null)
                 {
-                    notes.Add($"{progId}: GetActiveObject = 0x{hr:X8}");
+                    notes.Add($"{progId}: GetActiveObject = 0x{hr:X8} ({DescribeHresult(hr)})");
                     continue;
                 }
 
-                api5 = TryApi5From(instance, notes);
-                if (api5 == null) continue;
-
-                _kompas5 = api5;
-                message = "API 5: " + string.Join("; ", notes);
-                return _kompas5;
+                candidates.Add((instance, progId));
+                notes.Add($"{progId}: объект получен");
             }
 
-            // 3. Классический путь: CLSID класса Application из библиотеки Kompas6API5.
-            //    Даже если ProgID не зарегистрирован, этот класс обычно есть в системе.
-            foreach (string text in new[] { "6B0B5194-4ACD-4095-9BC1-11179FBBB05A" })
+            object? fallback = null;
+            string fallbackSource = string.Empty;
+
+            foreach (var (instance, source) in candidates)
             {
-                if (!Guid.TryParse(text, out Guid clsid))
-                {
-                    continue;
-                }
-
-                int hr = TryGetActiveObject(clsid, out object? instance);
-                if (hr != 0 || instance == null)
-                {
-                    notes.Add($"CLSID {{{text}}}: GetActiveObject = 0x{hr:X8}");
-                    continue;
-                }
-
-                api5 = TryApi5From(instance, notes);
+                object? api5 = ProbeApi5(instance, notes, out bool verified);
                 if (api5 == null) continue;
 
-                _kompas5 = api5;
-                message = "API 5: " + string.Join("; ", notes);
+                if (verified)
+                {
+                    _kompas5 = api5;
+                    message = $"API 5: {source} — " + string.Join("; ", notes);
+                    return _kompas5;
+                }
+
+                if (fallback == null)
+                {
+                    fallback = api5;
+                    fallbackSource = source;
+                }
+            }
+
+            // Ни один кандидат не подтвердил API 5 методом ActiveDocument3D:
+            // берём первый и покажем подробности в диагностике.
+            if (fallback != null)
+            {
+                _kompas5 = fallback;
+                message = $"API 5: {fallbackSource} (без подтверждения) — " + string.Join("; ", notes);
                 return _kompas5;
             }
 
-            message = "API 5 недоступен (" + string.Join("; ", notes) + ")";
+            message = "API 5 недоступен — " + string.Join("; ", notes);
             return null;
         }
 
         /// <summary>
-        /// Пробует получить корневой объект API 5 из объекта приложения: сначала
-        /// CastTo("KompasObject"), затем проверка ActiveDocument3D, затем сам объект.
+        /// Проверяет, отдаёт ли объект интерфейс приложения API 5. Признак API 5 —
+        /// работающий метод ActiveDocument3D/ActiveDocument2D (в API 7 их нет).
         /// </summary>
-        private static object? TryApi5From(object? application, List<string> notes)
+        private static object? ProbeApi5(object instance, List<string> notes, out bool verified)
         {
-            if (application == null) return null;
+            verified = false;
 
+            // CastTo("KompasObject") поддерживается не всеми версиями — пробуем и уходим дальше.
             foreach (string typeName in new[] { "KompasObject", "API5::KompasObject" })
             {
-                object? cast = Call(application, "CastTo", typeName);
-                if (cast == null)
-                {
-                    notes.Add($"CastTo(\"{typeName}\"): нет");
-                    continue;
-                }
+                object? cast = Call(instance, "CastTo", typeName);
+                if (cast == null || ReferenceEquals(cast, instance)) continue;
 
-                if (!ReferenceEquals(cast, application))
-                {
-                    notes.Add($"CastTo(\"{typeName}\"): ок");
-                    return cast;
-                }
+                notes.Add($"CastTo(\"{typeName}\"): ок");
+                verified = HasActiveDocument(cast);
+                return cast;
             }
 
-            // Объект может уже быть приложением API 5 (основной dispinterface coclass Application).
-            if (Call(application, "ActiveDocument3D") != null)
+            if (HasActiveDocument(instance))
             {
-                notes.Add("объект уже API 5 (ActiveDocument3D)");
-                return application;
+                notes.Add("ActiveDocument3D: доступен");
+                verified = true;
+                return instance;
             }
 
-            if (Call(application, "ActiveDocument") != null || Call(application, "Documents") != null)
-            {
-                notes.Add("объект приложения без открытого 3D-документа");
-                return application;
-            }
-
-            return null;
+            notes.Add("ActiveDocument3D: недоступен");
+            return instance;
         }
+
+        private static bool HasActiveDocument(object application)
+            => Call(application, "ActiveDocument3D") != null
+               || Call(application, "ActiveDocument2D") != null;
 
         /// <summary>
         /// Читает геометрию активной детали через API 5:
@@ -735,23 +728,20 @@ namespace KompasTrochoidCam.Services
                 if (document3D == null)
                 {
                     AppendDiagnostics(log);
-                    message = "Активный документ КОМПАС не является 3D-моделью — откройте деталь .m3d";
+                    message = "Активный документ КОМПАС не является 3D-моделью — сделайте активным окно детали .m3d и нажмите «Обновить геометрию»";
                     return geometry;
                 }
 
                 geometry.DocumentName = GetActiveDocName();
                 log.Add($"Документ: {geometry.DocumentName}");
 
-                object? part = Call(document3D, "GetPart", (int)TopPartIndex)
-                               ?? Call(document3D, "GetPart", TopPartIndex);
+                object? part = ResolvePart(document3D, log);
                 if (part == null)
                 {
                     AppendDiagnostics(log);
-                    message = "Не удалось получить компонент детали: ksDocument3D.GetPart(-1) вернул пусто";
+                    message = "Не удалось получить компонент детали (ksDocument3D.GetPart)";
                     return geometry;
                 }
-
-                log.Add("TopPart: получен через GetPart(pTop_Part)");
 
                 var faceObjects = GetFaceObjects(part, log);
                 log.Add($"Граней в модели: {faceObjects.Count}");
@@ -821,6 +811,42 @@ namespace KompasTrochoidCam.Services
             // Отчёт читают глазами: старые записи обрезаем, чтобы файл не разрастался.
             const int limit = 40000;
             LastDiagnostics = combined.Length <= limit ? combined : combined[^limit..];
+        }
+
+        /// <summary>
+        /// Компонент детали. Штатный индекс — pTop_Part (-1); для одиночной детали
+        /// часть версий отдаёт компонент по номеру 0 или 1. Выбирается тот, у которого
+        /// есть тела.
+        /// </summary>
+        private static object? ResolvePart(object document3D, List<string> log)
+        {
+            object? first = null;
+
+            foreach (int index in new[] { (int)TopPartIndex, 0, 1 })
+            {
+                object? part = Call(document3D, "GetPart", index)
+                               ?? Call(document3D, "GetPart", (short)index);
+
+                if (part == null)
+                {
+                    log.Add($"GetPart({index}): пусто");
+                    continue;
+                }
+
+                int bodies = CollectionItems(Call(part, "BodyCollection")).Count;
+                log.Add($"GetPart({index}): компонент получен, тел {bodies}");
+
+                if (bodies > 0)
+                {
+                    log.Add($"TopPart: выбран GetPart({index})");
+                    return part;
+                }
+
+                first ??= part;
+            }
+
+            if (first != null) log.Add("TopPart: тела не найдены, взят первый полученный компонент");
+            return first;
         }
 
         /// <summary>
