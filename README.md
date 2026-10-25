@@ -60,7 +60,7 @@
 | Язык, платформа | C#, .NET 10 (`net10.0-windows`), `WinExe` |
 | UI | Avalonia UI 12.1.4 (FluentTheme, шрифт Inter, `ViewLocator`) |
 | MVVM | CommunityToolkit.Mvvm 8.4.2 (`[ObservableProperty]`, `[RelayCommand]`) |
-| Интеграция с CAD | COM API КОМПАС‑3D v7: `System.Reflection` + P/Invoke `oleaut32.dll`/`ole32.dll` (CLSID по ProgID, обход ROT, диагностика); для интерфейсов не по умолчанию — `QueryInterface` по IID из библиотеки типов и вызов через IDispatch-слоты vtable |
+| Интеграция с CAD | COM-подключение к запущенному КОМПАС‑3D: `System.Reflection` + P/Invoke `oleaut32.dll`/`ole32.dll` (CLSID по ProgID, обход ROT, диагностика). Геометрия читается по **API 5** (`KompasObject`: `ActiveDocument3D` → `GetPart(-1)` → `BodyCollection` → `FaceCollection` → `LoopCollection` → `EdgeCollection` → `GetCurve3D().CalculatePolygon`), где все интерфейсы Automation-совместимые — вызовы идут через `IDispatch`, без работы с vtable |
 | Хранение проекта | `System.Text.Json`, файл `.tcplan` |
 | Прочее | `System.Management` 10.0.13, `AvaloniaUI.DiagnosticsSupport` (только Debug) |
 | Решение | `KompasTrochoidCam.slnx`, манифест `app.manifest` (Windows 10) |

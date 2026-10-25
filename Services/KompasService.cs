@@ -11,13 +11,16 @@ using KompasTrochoidCam.Models;
 namespace KompasTrochoidCam.Services
 {
     /// <summary>
-    /// Подключение к запущенному КОМПАС-3D через внешний COM API 7.
-    /// Чтение выполняется поздним связыванием (reflection), поэтому ссылки на
-    /// библиотеки КОМПАС не требуются при сборке.
+    /// Подключение к запущенному КОМПАС-3D по COM. Подключение идёт через приложение
+    /// API 7 (у него зарегистрирован ProgID), а геометрия читается по API 5
+    /// (KompasObject), где все интерфейсы Automation-совместимые и вызываются штатным
+    /// поздним связыванием через IDispatch. Ссылки на библиотеки КОМПАС при сборке
+    /// не требуются.
     /// </summary>
     public class KompasService
     {
         private object? _kompasApp;
+        private object? _kompas5;
         private object? _activeDocument;
 
         // Ошибки, которые возвращает GetActiveObject.
@@ -149,6 +152,7 @@ namespace KompasTrochoidCam.Services
         public bool Connect(out string errorMessage)
         {
             _kompasApp = null;
+            _kompas5 = null;
             _activeDocument = null;
 
             var log = new List<string> { "=== Подключение к КОМПАС-3D ===", $"Время: {DateTime.Now:yyyy-MM-dd HH:mm:ss}" };
@@ -542,8 +546,11 @@ namespace KompasTrochoidCam.Services
             if (document != null) _activeDocument = document;
         }
 
-        // Тип объектов 3D-документа (ksObj3dTypeEnum): 6 — грань, 7 — ребро.
-        private const int Obj3dFace = 6;
+        // Тип объектов 3D-документа (ksObj3dTypeEnum): 6 — грань.
+        private const short Obj3dFace = 6;
+
+        /// <summary>Индекс верхнего компонента детали (pTop_Part) в API 5.</summary>
+        private const short TopPartIndex = -1;
 
         /// <summary>Разброс Z, при котором грань считается горизонтальной, мм.</summary>
         private const double HorizontalTolerance = 0.05;
@@ -567,9 +574,130 @@ namespace KompasTrochoidCam.Services
         }
 
         /// <summary>
-        /// Читает геометрию активной детали по объектной модели API 7:
-        /// TopPart → IFeature7::ModelObjects(o3d_face) → IFace::Loops
-        /// → ILoop7::OrientedEdges → IOrientedEdge7::Edge → IEdge::MathCurve.
+        /// Приложение КОМПАС в терминах API 5 (KompasObject): ActiveDocument3D, GetParamStruct,
+        /// Document3D и т.д. Все интерфейсы этого API — Automation-совместимые
+        /// (ksPart, ksBody, ksFaceDefinition, ksLoop, ksEdgeDefinition, ksCurve3D),
+        /// поэтому вызываются обычным поздним связыванием через IDispatch.
+        /// </summary>
+        private object? ResolveApi5(out string message)
+        {
+            if (_kompas5 != null)
+            {
+                message = "API 5: уже подключено";
+                return _kompas5;
+            }
+
+            var notes = new List<string>();
+
+            // 1. У coclass Application основной dispinterface — KompasObject (API 5),
+            //    поэтому уже подключённый объект приложения обычно вызывает ActiveDocument3D.
+            object? api5 = TryApi5From(_kompasApp, notes);
+            if (api5 != null)
+            {
+                _kompas5 = api5;
+                message = "API 5: " + string.Join("; ", notes);
+                return _kompas5;
+            }
+
+            // 2. Отдельное подключение по ProgID API 5 (в КОМПАС v19-v22 ProgID зарегистрирован).
+            foreach (string progId in new[] { "KOMPAS.Application.5", "KOMPAS.Application" })
+            {
+                Guid? clsid = ResolveClsidFromProgId(progId);
+                if (clsid == null)
+                {
+                    notes.Add($"{progId}: нет в реестре COM");
+                    continue;
+                }
+
+                int hr = TryGetActiveObject(clsid.Value, out object? instance);
+                if (hr != 0 || instance == null)
+                {
+                    notes.Add($"{progId}: GetActiveObject = 0x{hr:X8}");
+                    continue;
+                }
+
+                api5 = TryApi5From(instance, notes);
+                if (api5 == null) continue;
+
+                _kompas5 = api5;
+                message = "API 5: " + string.Join("; ", notes);
+                return _kompas5;
+            }
+
+            // 3. Классический путь: CLSID класса Application из библиотеки Kompas6API5.
+            //    Даже если ProgID не зарегистрирован, этот класс обычно есть в системе.
+            foreach (string text in new[] { "6B0B5194-4ACD-4095-9BC1-11179FBBB05A" })
+            {
+                if (!Guid.TryParse(text, out Guid clsid))
+                {
+                    continue;
+                }
+
+                int hr = TryGetActiveObject(clsid, out object? instance);
+                if (hr != 0 || instance == null)
+                {
+                    notes.Add($"CLSID {{{text}}}: GetActiveObject = 0x{hr:X8}");
+                    continue;
+                }
+
+                api5 = TryApi5From(instance, notes);
+                if (api5 == null) continue;
+
+                _kompas5 = api5;
+                message = "API 5: " + string.Join("; ", notes);
+                return _kompas5;
+            }
+
+            message = "API 5 недоступен (" + string.Join("; ", notes) + ")";
+            return null;
+        }
+
+        /// <summary>
+        /// Пробует получить корневой объект API 5 из объекта приложения: сначала
+        /// CastTo("KompasObject"), затем проверка ActiveDocument3D, затем сам объект.
+        /// </summary>
+        private static object? TryApi5From(object? application, List<string> notes)
+        {
+            if (application == null) return null;
+
+            foreach (string typeName in new[] { "KompasObject", "API5::KompasObject" })
+            {
+                object? cast = Call(application, "CastTo", typeName);
+                if (cast == null)
+                {
+                    notes.Add($"CastTo(\"{typeName}\"): нет");
+                    continue;
+                }
+
+                if (!ReferenceEquals(cast, application))
+                {
+                    notes.Add($"CastTo(\"{typeName}\"): ок");
+                    return cast;
+                }
+            }
+
+            // Объект может уже быть приложением API 5 (основной dispinterface coclass Application).
+            if (Call(application, "ActiveDocument3D") != null)
+            {
+                notes.Add("объект уже API 5 (ActiveDocument3D)");
+                return application;
+            }
+
+            if (Call(application, "ActiveDocument") != null || Call(application, "Documents") != null)
+            {
+                notes.Add("объект приложения без открытого 3D-документа");
+                return application;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Читает геометрию активной детали через API 5:
+        /// ActiveDocument3D → GetPart(pTop_Part) → BodyCollection → FaceCollection
+        /// → ksFaceDefinition::LoopCollection → ksLoop::EdgeCollection
+        /// → ksEdgeDefinition::GetCurve3D → ksCurve3D::CalculatePolygon.
+        /// Каждый вызов изолирован: сбой одного элемента не прерывает чтение модели.
         /// </summary>
         public PartGeometry ReadPartGeometry(out string message)
         {
@@ -579,75 +707,97 @@ namespace KompasTrochoidCam.Services
                 Source = "kompas"
             };
 
-            KompasApi7Diagnostics.Clear();
-            var log = new List<string> { "=== Чтение геометрии ===" };
+            var log = new List<string> { "=== Чтение геометрии (API 5) ===" };
 
-            if (_kompasApp == null)
+            object? api5 = null;
+            string apiMessage = "API 5: не инициализировано";
+            try
             {
-                message = "Нет подключения к КОМПАС-3D";
-                return geometry;
+                api5 = ResolveApi5(out apiMessage);
+            }
+            catch (Exception ex)
+            {
+                apiMessage = "API 5: ошибка " + DescribeException(ex);
             }
 
-            RefreshActiveDocument();
+            log.Add(apiMessage);
 
-            if (_activeDocument == null)
+            if (api5 == null)
             {
-                message = "В КОМПАС-3D не открыт документ";
+                AppendDiagnostics(log);
+                message = "Нет доступа к API 5 КОМПАС-3D. Запустите КОМПАС-3D, откройте деталь .m3d и нажмите «Обновить геометрию».";
                 return geometry;
             }
-
-            geometry.DocumentName = GetActiveDocName();
-            log.Add($"Документ: {geometry.DocumentName}");
 
             try
             {
-                object? topPart = ResolveTopPart(log);
-                log.Add(topPart == null
-                    ? "TopPart: не получен — активный документ не является 3D-моделью"
-                    : "TopPart: получен");
-
-                if (topPart != null)
+                object? document3D = Call(api5, "ActiveDocument3D");
+                if (document3D == null)
                 {
-                    var faceObjects = GetModelObjects(topPart, Obj3dFace, log);
-                    log.Add($"Граней в модели: {faceObjects.Count}");
-
-                    var edges = new Dictionary<string, PartEdge>(StringComparer.Ordinal);
-                    int faceId = 0;
-                    int withoutLoops = 0;
-                    int notHorizontal = 0;
-
-                    foreach (object faceObject in faceObjects)
-                    {
-                        PartFace? face = ReadHorizontalFace(faceObject, ++faceId, edges, out bool hasLoops);
-                        if (face != null)
-                        {
-                            geometry.Faces.Add(face);
-                            continue;
-                        }
-
-                        if (hasLoops) notHorizontal++;
-                        else withoutLoops++;
-                    }
-
-                    log.Add($"Пропущено граней: без циклов {withoutLoops}, не горизонтальных {notHorizontal}");
-
-                    foreach (PartEdge edge in edges.Values)
-                    {
-                        edge.Id = geometry.Edges.Count + 1;
-                        geometry.Edges.Add(edge);
-                    }
-
-                    log.Add($"Горизонтальных граней: {geometry.Faces.Count}; рёбер: {geometry.Edges.Count}");
+                    AppendDiagnostics(log);
+                    message = "Активный документ КОМПАС не является 3D-моделью — откройте деталь .m3d";
+                    return geometry;
                 }
+
+                geometry.DocumentName = GetActiveDocName();
+                log.Add($"Документ: {geometry.DocumentName}");
+
+                object? part = Call(document3D, "GetPart", (int)TopPartIndex)
+                               ?? Call(document3D, "GetPart", TopPartIndex);
+                if (part == null)
+                {
+                    AppendDiagnostics(log);
+                    message = "Не удалось получить компонент детали: ksDocument3D.GetPart(-1) вернул пусто";
+                    return geometry;
+                }
+
+                log.Add("TopPart: получен через GetPart(pTop_Part)");
+
+                var faceObjects = GetFaceObjects(part, log);
+                log.Add($"Граней в модели: {faceObjects.Count}");
+
+                if (faceObjects.Count == 0)
+                {
+                    AppendDiagnostics(log);
+                    message = "В документе не найдено тел с гранями — проверьте, что деталь содержит твёрдое тело";
+                    return geometry;
+                }
+
+                var edges = new Dictionary<string, PartEdge>(StringComparer.Ordinal);
+                int faceId = 0;
+                int withoutLoops = 0;
+                int notHorizontal = 0;
+
+                foreach (object faceObject in faceObjects)
+                {
+                    PartFace? face = ReadHorizontalFace(faceObject, ++faceId, edges, out bool hasLoops);
+                    if (face != null)
+                    {
+                        geometry.Faces.Add(face);
+                        continue;
+                    }
+
+                    if (hasLoops) notHorizontal++;
+                    else withoutLoops++;
+                }
+
+                log.Add($"Пропущено граней: без циклов {withoutLoops}, не горизонтальных {notHorizontal}");
+
+                foreach (PartEdge edge in edges.Values)
+                {
+                    edge.Id = geometry.Edges.Count + 1;
+                    geometry.Edges.Add(edge);
+                }
+
+                log.Add($"Горизонтальных граней: {geometry.Faces.Count}; рёбер: {geometry.Edges.Count}");
 
                 geometry.RecalculateBounds();
                 if (!geometry.IsEmpty) log.Add($"Габариты детали: {geometry.SizeText}");
 
-                AppendComLog(log);
                 AppendDiagnostics(log);
 
                 message = geometry.IsEmpty
-                    ? "В активном документе не найдено горизонтальных граней — откройте деталь .m3d с телом и нажмите «Обновить геометрию»"
+                    ? "В активном документе не найдено горизонтальных граней — проверьте, что деталь содержит тело, и нажмите «Диагностику»"
                     : $"Геометрия загружена: граней {geometry.Faces.Count}, рёбер {geometry.Edges.Count}";
 
                 return geometry;
@@ -655,115 +805,78 @@ namespace KompasTrochoidCam.Services
             catch (Exception ex)
             {
                 log.Add("Ошибка: " + DescribeException(ex));
-                AppendComLog(log);
                 AppendDiagnostics(log);
                 message = $"Ошибка чтения геометрии: {DescribeException(ex)}";
                 return geometry;
             }
         }
 
-        /// <summary>
-        /// Верхний компонент детали. Штатный путь API 7 — свойство TopPart у 3D-документа;
-        /// запасные — COM-имя GetTopPart и путь API 5 через ActiveDocument3D.
-        /// </summary>
-        private object? ResolveTopPart(List<string> log)
-        {
-            object? topPart = GetProperty(_activeDocument, "TopPart");
-            if (topPart != null) return topPart;
-
-            topPart = InvokeMemberSafe(_activeDocument, "GetTopPart", null);
-            if (topPart != null)
-            {
-                log.Add("TopPart: получен через GetTopPart()");
-                return topPart;
-            }
-
-            object? document3D = GetProperty(_kompasApp, "ActiveDocument3D");
-            if (document3D == null) return null;
-
-            topPart = GetProperty(document3D, "TopPart");
-            if (topPart != null)
-            {
-                log.Add("TopPart: получен через ActiveDocument3D");
-                return topPart;
-            }
-
-            topPart = InvokeMemberSafe(document3D, "GetPart", new object?[] { -1 })
-                      ?? InvokeMemberSafe(document3D, "GetPart", new object?[] { (short)-1 });
-
-            if (topPart != null) log.Add("TopPart: получен через Document3D.GetPart(-1)");
-
-            return topPart;
-        }
-
-        private void AppendComLog(List<string> lines)
-        {
-            IReadOnlyList<string> com = KompasApi7Diagnostics.Snapshot();
-            if (com.Count == 0) return;
-
-            lines.Add("Обращения к COM-интерфейсам:");
-            foreach (string entry in com) lines.Add("  • " + entry);
-        }
-
         private void AppendDiagnostics(List<string> lines)
         {
             string text = string.Join(Environment.NewLine, lines);
-            LastDiagnostics = string.IsNullOrEmpty(LastDiagnostics)
+            string combined = string.IsNullOrEmpty(LastDiagnostics)
                 ? text
                 : LastDiagnostics + Environment.NewLine + Environment.NewLine + text;
+
+            // Отчёт читают глазами: старые записи обрезаем, чтобы файл не разрастался.
+            const int limit = 40000;
+            LastDiagnostics = combined.Length <= limit ? combined : combined[^limit..];
         }
 
         /// <summary>
-        /// Объекты заданного типа у элемента дерева построения (IFeature7::ModelObjects).
-        /// Сначала пробуется обычное позднее связывание, затем QueryInterface к IFeature7.
+        /// Грани детали. Основной путь — BodyCollection → ksBody::FaceCollection;
+        /// запасные — GetMainBody() и EntityCollection(o3d_face).
         /// </summary>
-        private static List<object> GetModelObjects(object part, int objType, List<string> log)
+        private static List<object> GetFaceObjects(object part, List<string> log)
         {
-            var result = new List<object>();
+            var faces = new List<object>();
 
-            foreach (string member in new[] { "ModelObjects", "GetModelObjects" })
+            var bodies = CollectionItems(Call(part, "BodyCollection"));
+            log.Add($"BodyCollection: {bodies.Count} тел");
+
+            foreach (object body in bodies)
+                faces.AddRange(CollectionItems(Call(body, "FaceCollection")));
+
+            if (faces.Count == 0)
             {
-                object? raw = TryGetMember(part, member, new object?[] { objType }, null)
-                              ?? TryGetMember(part, member, new object?[] { (short)objType }, null);
+                var mainBodyFaces = CollectionItems(Call(Call(part, "GetMainBody"), "FaceCollection"));
+                if (mainBodyFaces.Count > 0) log.Add($"GetMainBody: {mainBodyFaces.Count} граней");
+                faces.AddRange(mainBodyFaces);
+            }
 
-                AddObjects(result, raw, part);
-                if (result.Count > 0)
+            if (faces.Count == 0)
+            {
+                var entities = CollectionItems(
+                    Call(part, "EntityCollection", Obj3dFace)
+                    ?? Call(part, "EntityCollection", (int)Obj3dFace));
+
+                log.Add($"EntityCollection(o3d_face): {entities.Count} объектов");
+
+                foreach (object entity in entities)
                 {
-                    log.Add($"{member}: {result.Count} объектов");
-                    return result;
+                    object? definition = Call(entity, "GetDefinition");
+                    faces.Add(definition ?? entity);
                 }
             }
 
-            log.Add("Прямое обращение к ModelObjects недоступно — приводим TopPart к IFeature7");
-
-            using ComDispatch? feature = KompasApi7.Cast(part, "IFeature7");
-            if (feature == null)
-            {
-                log.Add("IFeature7: " + (KompasApi7.LastError.Length > 0 ? KompasApi7.LastError : "недоступен"));
-                return result;
-            }
-
-            foreach (object type in new object[] { objType, (short)objType })
-            {
-                AddObjects(result, feature.Get("ModelObjects", type), part);
-                if (result.Count > 0)
-                {
-                    log.Add($"IFeature7.ModelObjects: {result.Count} объектов");
-                    return result;
-                }
-            }
-
-            log.Add("IFeature7.ModelObjects: коллекция пуста");
-            return result;
+            return faces;
         }
 
-        private static void AddObjects(List<object> target, object? raw, object? owner)
+        /// <summary>Элементы automation-коллекции API 5 (GetCount / GetByIndex).</summary>
+        private static List<object> CollectionItems(object? collection)
         {
-            foreach (object item in Flatten(raw))
+            var items = new List<object>();
+            if (collection == null) return items;
+
+            int count = ToInt(Call(collection, "GetCount"));
+            for (int i = 0; i < count; i++)
             {
-                if (ReferenceEquals(item, owner)) continue;
-                target.Add(item);
+                object? item = Call(collection, "GetByIndex", i)
+                               ?? Call(collection, "GetByIndex", (short)i);
+                if (item != null) items.Add(item);
             }
+
+            return items;
         }
 
         /// <summary>
@@ -771,18 +884,13 @@ namespace KompasTrochoidCam.Services
         /// для 2.5D-фрезерования по Z-уровням нужны только плоскости XY.
         /// </summary>
         private static PartFace? ReadHorizontalFace(
-            object faceObject,
+            object faceDefinition,
             int id,
             Dictionary<string, PartEdge> edges,
             out bool hasLoops)
         {
-            var loopObjects = Flatten(GetMember(faceObject, "Loops", "IFace")).ToList();
-            var limitingEdges = new List<object>();
-
-            if (loopObjects.Count == 0)
-                limitingEdges = Flatten(GetMember(faceObject, "LimitingEdges", "IFace")).ToList();
-
-            hasLoops = loopObjects.Count > 0 || limitingEdges.Count > 0;
+            var loopObjects = CollectionItems(Call(faceDefinition, "LoopCollection"));
+            hasLoops = loopObjects.Count > 0;
             if (!hasLoops) return null;
 
             var face = new PartFace { Id = id, Name = $"Грань #{id}" };
@@ -791,36 +899,33 @@ namespace KompasTrochoidCam.Services
             double zSum = 0;
             int zCount = 0;
 
-            var loops = new List<(List<Point3> Points, bool IsOuter)>();
+            var loops = new List<(List<TrochoidEngine.Point2D> Points, double Area, bool IsOuter)>();
 
             foreach (object loopObject in loopObjects)
             {
-                if (TryReadLoop(loopObject, id, edges, out List<Point3> points, out bool isOuter))
-                    loops.Add((points, isOuter));
-            }
+                bool isOuter = ToBool(Call(loopObject, "IsOuter"), false);
 
-            // Резерв, если циклы недоступны: ребра грани отдельным массивом.
-            if (loops.Count == 0 && limitingEdges.Count > 0)
-            {
+                // ksLoop::EdgeCollection — рёбра в порядке обхода;
+                // OrientedEdgeCollection — запасной вариант.
+                var edgeObjects = CollectionItems(Call(loopObject, "EdgeCollection"));
+                if (edgeObjects.Count == 0)
+                    edgeObjects = CollectionItems(Call(loopObject, "OrientedEdgeCollection"));
+
                 var pieces = new List<List<Point3>>();
-                foreach (object edgeObject in limitingEdges)
+                foreach (object edgeObject in edgeObjects)
                 {
-                    var piece = ReadEdgePoints(edgeObject);
-                    if (piece.Count >= 2)
-                    {
-                        pieces.Add(piece);
-                        RememberEdge(edges, piece, id);
-                    }
+                    List<Point3> piece = ReadEdgePoints(edgeObject);
+                    if (piece.Count < 2) continue;
+
+                    pieces.Add(piece);
+                    RememberEdge(edges, piece, id);
                 }
 
                 List<Point3> chained = ChainPieces(pieces);
-                if (chained.Count >= 3) loops.Add((chained, true));
-            }
+                if (chained.Count < 3) continue;
 
-            foreach ((List<Point3> points, bool isOuter) in loops)
-            {
-                var flat = new List<TrochoidEngine.Point2D>(points.Count);
-                foreach (Point3 point in points)
+                var flat = new List<TrochoidEngine.Point2D>(chained.Count);
+                foreach (Point3 point in chained)
                 {
                     flat.Add(new TrochoidEngine.Point2D(point.X, point.Y));
                     minZ = Math.Min(minZ, point.Z);
@@ -832,18 +937,24 @@ namespace KompasTrochoidCam.Services
                 var normalized = GeometryMath.NormalizeLoop(flat);
                 if (normalized.Count < 3) continue;
 
-                face.Loops.Add(new PartLoop { Points = normalized, IsOuter = isOuter });
+                loops.Add((normalized, GeometryMath.Area(normalized), isOuter));
             }
 
-            if (face.Loops.Count == 0 || zCount == 0) return null;
+            if (loops.Count == 0 || zCount == 0) return null;
 
             // Все вершины грани должны лежать в одной плоскости XY.
             if (maxZ - minZ > HorizontalTolerance) return null;
 
-            face.Z = zSum / zCount;
+            // Внешний цикл — по признаку IsOuter; если система его не дала, берём наибольший по площади.
+            int outerIndex = loops.FindIndex(loop => loop.IsOuter);
+            if (outerIndex < 0)
+                outerIndex = loops.IndexOf(loops.OrderByDescending(loop => loop.Area).First());
 
-            PartLoop outerLoop = face.Loops.FirstOrDefault(loop => loop.IsOuter) ?? face.Loops[0];
-            face.NormalZ = GeometryMath.SignedArea(outerLoop.Points) < 0 ? -1.0 : 1.0;
+            for (int i = 0; i < loops.Count; i++)
+                face.Loops.Add(new PartLoop { Points = loops[i].Points, IsOuter = i == outerIndex });
+
+            face.Z = zSum / zCount;
+            face.NormalZ = GeometryMath.SignedArea(face.Loops[outerIndex].Points) < 0 ? -1.0 : 1.0;
             face.NormalX = 0;
             face.NormalY = 0;
             face.Area = GeometryMath.FaceArea(face);
@@ -854,67 +965,119 @@ namespace KompasTrochoidCam.Services
             return face;
         }
 
-        private static bool TryReadLoop(
-            object loopObject,
-            int faceId,
-            Dictionary<string, PartEdge> edges,
-            out List<Point3> points,
-            out bool isOuter)
+        /// <summary>
+        /// Точки ребра. Основной путь — GetCurve3D().CalculatePolygon(шаг);
+        /// запасной — две вершины ребра (прямая).
+        /// </summary>
+        private static List<Point3> ReadEdgePoints(object edgeObject)
         {
-            isOuter = ToBool(GetMember(loopObject, "IsOuter", "ILoop7"), true);
+            object? curve = Call(edgeObject, "GetCurve3D");
 
-            var oriented = Flatten(GetMember(loopObject, "OrientedEdges", "ILoop7")).ToList();
-            bool useOriented = oriented.Count > 0;
-            if (!useOriented) oriented = Flatten(GetMember(loopObject, "Edges", "ILoop7")).ToList();
-
-            var pieces = new List<List<Point3>>();
-            foreach (object item in oriented)
+            if (curve == null)
             {
-                object? edgeObject = useOriented
-                    ? (GetMember(item, "Edge", "IOrientedEdge7") ?? item)
-                    : item;
-
-                if (edgeObject == null) continue;
-
-                var piece = ReadEdgePoints(edgeObject);
-                if (piece.Count < 2) continue;
-
-                pieces.Add(piece);
-                RememberEdge(edges, piece, faceId);
+                // У ориентированного ребра кривая лежит на вложенном ребре.
+                object? nested = Call(edgeObject, "GetEdge") ?? Call(edgeObject, "Edge");
+                curve = Call(nested, "GetCurve3D")
+                        ?? Call(Call(nested, "GetDefinition"), "GetCurve3D");
             }
 
-            points = ChainPieces(pieces);
-            return points.Count >= 3;
+            var points = ReadCurvePoints(curve);
+            if (points.Count >= 2) return points;
+
+            points.Clear();
+            foreach (bool start in new[] { true, false })
+            {
+                object? vertex = Call(edgeObject, "GetVertex", start);
+                Point3? point = ReadPoint(vertex) ?? ReadPoint(Call(vertex, "GetPoint"));
+                if (point != null) points.Add(point.Value);
+            }
+
+            return points;
+        }
+
+        /// <summary>Точки кривой ребра: ksCurve3D::CalculatePolygon отдаёт плоский массив x,y,z.</summary>
+        private static List<Point3> ReadCurvePoints(object? curve)
+        {
+            if (curve == null) return new List<Point3>();
+
+            object? polygon = Call(curve, "CalculatePolygon", CurveStepMm)
+                              ?? Call(curve, "CalculatePolygon", -1.0)
+                              ?? Call(curve, "CalculatePolygon", 0.0);
+
+            return ReadPointsArray(polygon);
+        }
+
+        /// <summary>Читает точку по свойствам X/Y/Z (ksVertexDefinition::GetPoint и подобные).</summary>
+        private static Point3? ReadPoint(object? pointObject)
+        {
+            if (pointObject == null) return null;
+
+            object? x = Call(pointObject, "X") ?? GetMember(pointObject, "X");
+            object? y = Call(pointObject, "Y") ?? GetMember(pointObject, "Y");
+            object? z = Call(pointObject, "Z") ?? GetMember(pointObject, "Z");
+
+            if (x == null && y == null) return null;
+
+            return new Point3(ToDouble(x), ToDouble(y), ToDouble(z));
         }
 
         /// <summary>
-        /// Сшивает куски в один контур по близости концов: направление обхода каждой
-        /// дуги/ребра в API не гарантировано, а для построения области это критично.
+        /// Сшивает куски в один контур по близости концов: направление обхода и порядок
+        /// рёбер в массиве не гарантированы, а для построения области это критично.
+        /// Берётся ближайший к текущему концу кусок (с возможным разворотом).
         /// </summary>
         private static List<Point3> ChainPieces(List<List<Point3>> pieces)
         {
+            var remaining = pieces.Where(piece => piece.Count >= 2).ToList();
+            if (remaining.Count == 0) return new List<Point3>();
+
             var points = new List<Point3>();
+            List<Point3> start = remaining.OrderByDescending(piece => piece.Count).First();
+            remaining.Remove(start);
+            foreach (Point3 point in start) AppendDistinct(points, point);
 
-            foreach (List<Point3> piece in pieces)
+            while (remaining.Count > 0)
             {
-                if (piece.Count < 2) continue;
+                Point3 tail = points[points.Count - 1];
 
-                if (points.Count == 0)
+                int bestIndex = -1;
+                bool bestForward = true;
+                double bestDistance = double.MaxValue;
+
+                for (int i = 0; i < remaining.Count; i++)
                 {
-                    foreach (Point3 point in piece) AppendDistinct(points, point);
-                    continue;
+                    List<Point3> candidate = remaining[i];
+
+                    double toStart = Distance2D(tail, candidate[0]);
+                    if (toStart < bestDistance)
+                    {
+                        bestDistance = toStart;
+                        bestIndex = i;
+                        bestForward = true;
+                    }
+
+                    double toEnd = Distance2D(tail, candidate[candidate.Count - 1]);
+                    if (toEnd < bestDistance)
+                    {
+                        bestDistance = toEnd;
+                        bestIndex = i;
+                        bestForward = false;
+                    }
                 }
 
-                Point3 tail = points[points.Count - 1];
-                bool forward = Distance2D(tail, piece[0]) <= Distance2D(tail, piece[piece.Count - 1]);
+                // Разрыв контура: несшитые куски отбрасываем, иначе контур «схлопнется».
+                if (bestIndex < 0 || bestDistance > 0.5) break;
 
-                if (forward)
+                List<Point3> next = remaining[bestIndex];
+                remaining.RemoveAt(bestIndex);
+
+                if (bestForward)
                 {
-                    foreach (Point3 point in piece) AppendDistinct(points, point);
+                    for (int i = 1; i < next.Count; i++) AppendDistinct(points, next[i]);
                 }
                 else
                 {
-                    for (int i = piece.Count - 1; i >= 0; i--) AppendDistinct(points, piece[i]);
+                    for (int i = next.Count - 2; i >= 0; i--) AppendDistinct(points, next[i]);
                 }
             }
 
@@ -922,68 +1085,6 @@ namespace KompasTrochoidCam.Services
                 points.RemoveAt(points.Count - 1);
 
             return points;
-        }
-
-        /// <summary>Точки ребра по порядку: полигон кривой, при неудаче — две вершины.</summary>
-        private static List<Point3> ReadEdgePoints(object edgeObject)
-        {
-            object? curve = GetMember(edgeObject, "MathCurve", "IEdge");
-            if (curve != null)
-            {
-                object? polygon = InvokeMemberSafe(curve, "CalculatePolygon", new object?[] { CurveStepMm });
-                var sampled = ReadPointsArray(polygon);
-                if (sampled.Count >= 2) return sampled;
-            }
-
-            var points = new List<Point3>();
-
-            Point3? first = GetEdgeVertex(edgeObject, true);
-            Point3? last = GetEdgeVertex(edgeObject, false);
-
-            if (first.HasValue) points.Add(first.Value);
-            if (last.HasValue) points.Add(last.Value);
-
-            return points;
-        }
-
-        private static Point3? GetEdgeVertex(object edgeObject, bool start)
-        {
-            object? vertex = GetMember(edgeObject, "Vertex", "IEdge", new object?[] { start })
-                             ?? GetMember(edgeObject, "Vertex", "IEdge", new object?[] { start ? 1 : 0 });
-
-            return GetVertexPoint(vertex);
-        }
-
-        /// <summary>IVertex::GetPoint отдаёт координаты через выходные параметры (by ref).</summary>
-        private static Point3? GetVertexPoint(object? vertex)
-        {
-            if (vertex == null) return null;
-
-            object?[] args = { 0.0, 0.0, 0.0 };
-            var modifiers = new ParameterModifier(3);
-            modifiers[0] = true;
-            modifiers[1] = true;
-            modifiers[2] = true;
-
-            try
-            {
-                vertex.GetType().InvokeMember(
-                    "GetPoint",
-                    BindingFlags.InvokeMethod | BindingFlags.Public | BindingFlags.Instance,
-                    null,
-                    vertex,
-                    args,
-                    new[] { modifiers },
-                    CultureInfo.InvariantCulture,
-                    null);
-
-                return new Point3(ToDouble(args[0]), ToDouble(args[1]), ToDouble(args[2]));
-            }
-            catch
-            {
-                KompasApi7Diagnostics.Report("IVertex.GetPoint: вызов недоступен");
-                return null;
-            }
         }
 
         private static void RememberEdge(Dictionary<string, PartEdge> edges, List<Point3> points, int faceId)
@@ -1018,11 +1119,20 @@ namespace KompasTrochoidCam.Services
 
                 Point3 mid = points[points.Count / 2];
                 double midAngle = Math.Atan2(mid.Y - cy, mid.X - cx);
-                double midSpan = GeometryMath.NormalizeAngle(midAngle - a0);
 
-                bool ccw = midSpan < spanCcw;
-                edge.Clockwise = !ccw;
-                edge.Sweep = ccw ? spanCcw : Math.PI * 2 - spanCcw;
+                // У замкнутого кругового ребра начало и конец совпадают: это полный оборот.
+                bool closed = Distance2D(edge.Start, edge.End) < 1e-3;
+                if (closed)
+                {
+                    edge.Clockwise = false;
+                    edge.Sweep = Math.PI * 2;
+                }
+                else
+                {
+                    bool ccw = GeometryMath.NormalizeAngle(midAngle - a0) < spanCcw;
+                    edge.Clockwise = !ccw;
+                    edge.Sweep = ccw ? spanCcw : Math.PI * 2 - spanCcw;
+                }
             }
 
             edges[key] = edge;
@@ -1073,23 +1183,6 @@ namespace KompasTrochoidCam.Services
             return points;
         }
 
-        private static IEnumerable<object> Flatten(object? value)
-        {
-            if (value == null || value is string) yield break;
-
-            if (value is Array array && value is not double[])
-            {
-                foreach (object? item in array)
-                {
-                    if (item != null) yield return item;
-                }
-
-                yield break;
-            }
-
-            yield return value;
-        }
-
         private static void AppendDistinct(List<Point3> points, Point3 point)
         {
             if (points.Count > 0 && Distance(points[points.Count - 1], point) < 1e-4) return;
@@ -1117,8 +1210,7 @@ namespace KompasTrochoidCam.Services
             double ax = Math.Round(a.X, 3), ay = Math.Round(a.Y, 3), az = Math.Round(a.Z, 3);
             double bx = Math.Round(b.X, 3), by = Math.Round(b.Y, 3), bz = Math.Round(b.Z, 3);
 
-            bool forward = ax < bx
-                           || (ax == bx && (ay < by || (ay == by && az <= bz)));
+            bool forward = ax < bx || (ax == bx && (ay < by || (ay == by && az <= bz)));
 
             string head = FormattableString.Invariant($"{ax:F3},{ay:F3},{az:F3}");
             string tail = FormattableString.Invariant($"{bx:F3},{by:F3},{bz:F3}");
@@ -1127,39 +1219,10 @@ namespace KompasTrochoidCam.Services
         }
 
         /// <summary>
-        /// Член объекта: сначала обычное позднее связывание, затем — по указанному
-        /// интерфейсу через QueryInterface (объекты API 7 отдают только интерфейс по умолчанию).
+        /// Вызов метода automation-объекта API 5. Никогда не выбрасывает исключение:
+        /// сбой одного метода не должен ломать чтение всей модели.
         /// </summary>
-        private static object? GetMember(object? target, string member, string interfaceName, object?[]? args = null)
-        {
-            object? value = TryGetMember(target, member, args, null);
-            if (value != null || target == null) return value;
-
-            using ComDispatch? dispatch = KompasApi7.Cast(target, interfaceName);
-            return dispatch?.Get(member, args ?? Array.Empty<object?>());
-        }
-
-        private static object? TryGetMember(object? target, string member, object?[]? args, List<string>? log)
-        {
-            if (target == null) return null;
-
-            try
-            {
-                return target.GetType().InvokeMember(
-                    member,
-                    BindingFlags.GetProperty | BindingFlags.Public | BindingFlags.Instance,
-                    null,
-                    target,
-                    args);
-            }
-            catch (Exception ex)
-            {
-                log?.Add($"{member}: {DescribeException(ex)}");
-                return null;
-            }
-        }
-
-        private static object? InvokeMemberSafe(object? target, string member, object?[]? args)
+        private static object? Call(object? target, string member, params object?[] args)
         {
             if (target == null) return null;
 
@@ -1170,11 +1233,24 @@ namespace KompasTrochoidCam.Services
                     BindingFlags.InvokeMethod | BindingFlags.Public | BindingFlags.Instance,
                     null,
                     target,
-                    args);
+                    args.Length == 0 ? null : args);
             }
             catch
             {
-                return null;
+                // Часть методов API 5 объявлена как свойства — пробуем чтение свойства.
+                try
+                {
+                    return target.GetType().InvokeMember(
+                        member,
+                        BindingFlags.GetProperty | BindingFlags.Public | BindingFlags.Instance,
+                        null,
+                        target,
+                        args.Length == 0 ? null : args);
+                }
+                catch
+                {
+                    return null;
+                }
             }
         }
 
@@ -1193,7 +1269,6 @@ namespace KompasTrochoidCam.Services
             catch { return fallback; }
         }
 
-        /// <summary>
         /// Устаревший сценарий: контур выделенной плоской грани.
         /// Оставлен для совместимости; основной путь — <see cref="ReadPartGeometry"/>.
         /// </summary>

@@ -175,11 +175,20 @@ namespace KompasTrochoidCam.ViewModels
         [RelayCommand]
         private void Connect()
         {
-            bool connected = _kompasService.Connect(out string message);
-            ConnectionStatus = message;
-            StatusColor = connected ? Brushes.Green : Brushes.Red;
+            try
+            {
+                bool connected = _kompasService.Connect(out string message);
+                ConnectionStatus = message;
+                StatusColor = connected ? Brushes.Green : Brushes.Red;
 
-            if (connected) RefreshGeometry();
+                if (connected) RefreshGeometry();
+            }
+            catch (Exception ex)
+            {
+                // Сбой подключения не должен закрывать приложение.
+                ConnectionStatus = $"Ошибка подключения: {ex.Message}";
+                StatusColor = Brushes.Red;
+            }
         }
 
         /// <summary>Открывает отчёт о последней попытке подключения (ProgID, ROT, права, HRESULT).</summary>
@@ -214,7 +223,19 @@ namespace KompasTrochoidCam.ViewModels
                 return;
             }
 
-            var geometry = _kompasService.ReadPartGeometry(out string message);
+            PartGeometry geometry = new PartGeometry();
+            string message = string.Empty;
+            try
+            {
+                geometry = _kompasService.ReadPartGeometry(out message);
+            }
+            catch (Exception ex)
+            {
+                ConnectionStatus = $"Ошибка чтения геометрии: {ex.Message}";
+                StatusColor = Brushes.DarkOrange;
+                return;
+            }
+
             if (geometry.IsEmpty)
             {
                 // Подключение при этом успешное: красный цвет здесь означал бы «нет связи».
