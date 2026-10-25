@@ -639,12 +639,12 @@ namespace KompasTrochoidCam.Services
             }
 
             // Ни один кандидат не подтвердил API 5 методом ActiveDocument3D:
-            // берём первый и покажем подробности в диагностике.
+            // берём первый для чтения, но не запоминаем — при следующем обновлении
+            // проверим заново (документ могли открыть уже после подключения).
             if (fallback != null)
             {
-                _kompas5 = fallback;
                 message = $"API 5: {fallbackSource} (без подтверждения) — " + string.Join("; ", notes);
-                return _kompas5;
+                return fallback;
             }
 
             message = "API 5 недоступен — " + string.Join("; ", notes);
