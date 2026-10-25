@@ -542,8 +542,31 @@ namespace KompasTrochoidCam.Services
             if (document != null) _activeDocument = document;
         }
 
+        // Тип объектов 3D-документа (ksObj3dTypeEnum): 6 — грань, 7 — ребро.
+        private const int Obj3dFace = 6;
+
+        /// <summary>Разброс Z, при котором грань считается горизонтальной, мм.</summary>
+        private const double HorizontalTolerance = 0.05;
+
+        /// <summary>Точка в пространстве детали (внутреннее представление при чтении из КОМПАС).</summary>
+        private readonly struct Point3
+        {
+            public Point3(double x, double y, double z)
+            {
+                X = x;
+                Y = y;
+                Z = z;
+            }
+
+            public double X { get; }
+            public double Y { get; }
+            public double Z { get; }
+        }
+
         /// <summary>
-        /// Читает всю геометрию активной детали: плоские грани с контурами и рёбра тел.
+        /// Читает геометрию активной детали по объектной модели API 7:
+        /// IKompasDocument3D::TopPart → IFeature7::ModelObjects(o3d_face) → IFace::Loops
+        /// → ILoop7::OrientedEdges → IEdge::Vertex / IEdge::MathCurve → IVertex::GetPoint.
         /// </summary>
         public PartGeometry ReadPartGeometry(out string message)
         {
@@ -552,6 +575,8 @@ namespace KompasTrochoidCam.Services
                 LoadedAt = DateTime.Now,
                 Source = "kompas"
             };
+
+            var log = new List<string> { "=== Чтение геометрии ===" };
 
             if (_kompasApp == null)
             {
@@ -568,237 +593,509 @@ namespace KompasTrochoidCam.Services
             }
 
             geometry.DocumentName = GetActiveDocName();
+            log.Add($"Документ: {geometry.DocumentName}");
 
             try
             {
-                object? topPart = GetProperty(_activeDocument, "TopPart");
-                object? bodies = GetProperty(topPart, "Bodies");
-                int bodyCount = GetCount(bodies);
+                object? topPart = ResolveTopPart(log);
+                log.Add(topPart == null
+                    ? "TopPart: не получен — активный документ не является 3D-моделью"
+                    : "TopPart: получен");
 
-                if (bodyCount == 0)
+                if (topPart != null)
                 {
-                    message = "В документе нет тел. Откройте деталь .m3d с твёрдым телом.";
-                    return geometry;
-                }
+                    var faceObjects = GetModelObjects(topPart, Obj3dFace, log);
+                    log.Add($"Граней в модели: {faceObjects.Count}");
 
-                int faceId = 0;
-                int edgeId = 0;
-                var loopEdges = new List<PartEdge>();
+                    var edges = new Dictionary<string, PartEdge>(StringComparer.Ordinal);
+                    int faceId = 0;
+                    int withoutLoops = 0;
+                    int notHorizontal = 0;
 
-                for (int bodyIndex = 0; bodyIndex < bodyCount; bodyIndex++)
-                {
-                    object? body = GetItem(bodies, bodyIndex);
-                    if (body == null) continue;
-
-                    object? faces = GetProperty(body, "Faces");
-                    int faceCount = GetCount(faces);
-
-                    for (int faceIndex = 0; faceIndex < faceCount; faceIndex++)
+                    foreach (object faceObject in faceObjects)
                     {
-                        object? face = GetItem(faces, faceIndex);
-                        if (face == null) continue;
-                        var partFace = ReadFace(face, ++faceId, loopEdges);
-                        if (partFace != null) geometry.Faces.Add(partFace);
+                        PartFace? face = ReadHorizontalFace(faceObject, ++faceId, edges, out bool hasLoops);
+                        if (face != null)
+                        {
+                            geometry.Faces.Add(face);
+                            continue;
+                        }
+
+                        if (hasLoops) notHorizontal++;
+                        else withoutLoops++;
                     }
 
-                    object? bodyEdges = GetProperty(body, "Edges");
-                    int bodyEdgeCount = GetCount(bodyEdges);
+                    log.Add($"Пропущено граней: без циклов {withoutLoops}, не горизонтальных {notHorizontal}");
 
-                    for (int edgeIndex = 0; edgeIndex < bodyEdgeCount; edgeIndex++)
+                    foreach (PartEdge edge in edges.Values)
                     {
-                        object? edge = GetItem(bodyEdges, edgeIndex);
-                        var partEdge = ReadEdge(edge, ++edgeId, -1);
-                        if (partEdge != null) geometry.Edges.Add(partEdge);
-                    }
-                }
-
-                // Если тело не отдало коллекцию рёбер, берём рёбра из контуров граней.
-                if (geometry.Edges.Count == 0 && loopEdges.Count > 0)
-                {
-                    foreach (var edge in loopEdges)
-                    {
-                        edge.Id = ++edgeId;
+                        edge.Id = geometry.Edges.Count + 1;
                         geometry.Edges.Add(edge);
                     }
+
+                    log.Add($"Горизонтальных граней: {geometry.Faces.Count}; рёбер: {geometry.Edges.Count}");
                 }
 
                 geometry.RecalculateBounds();
+                if (!geometry.IsEmpty) log.Add($"Габариты детали: {geometry.SizeText}");
+
+                AppendDiagnostics(log);
 
                 message = geometry.IsEmpty
-                    ? "В активном документе не найдено плоских граней и рёбер."
+                    ? "В активном документе не найдено горизонтальных граней — откройте деталь .m3d с телом и нажмите «Обновить геометрию»"
                     : $"Геометрия загружена: граней {geometry.Faces.Count}, рёбер {geometry.Edges.Count}";
 
                 return geometry;
             }
             catch (Exception ex)
             {
-                message = $"Ошибка чтения геометрии: {ex.Message}";
+                log.Add("Ошибка: " + DescribeException(ex));
+                AppendDiagnostics(log);
+                message = $"Ошибка чтения геометрии: {DescribeException(ex)}";
                 return geometry;
             }
         }
 
-        private PartFace? ReadFace(object face, int id, List<PartEdge> loopEdges)
+        /// <summary>
+        /// Верхний компонент детали. Штатный путь API 7 — свойство TopPart у 3D-документа;
+        /// запасные — COM-имя GetTopPart и путь API 5 через ActiveDocument3D.
+        /// </summary>
+        private object? ResolveTopPart(List<string> log)
         {
-            object? surface = GetProperty(face, "Geometry");
-            int surfaceType = ToInt(GetProperty(surface, "SurfaceType"));
+            object? topPart = GetProperty(_activeDocument, "TopPart");
+            if (topPart != null) return topPart;
 
-            // 1 = плоская поверхность. Неизвестный тип (0) тоже пробуем прочитать.
-            if (surfaceType != 1 && surfaceType != 0) return null;
-
-            object? origin = GetProperty(surface, "Origin");
-            double z = ToDouble(GetMember(origin, "Z"));
-
-            double normalX = 0, normalY = 0, normalZ = 1;
-            object? normal = GetProperty(surface, "Normal");
-            if (normal != null)
+            topPart = InvokeMemberSafe(_activeDocument, "GetTopPart", null);
+            if (topPart != null)
             {
-                normalX = ToDouble(GetMember(normal, "X"));
-                normalY = ToDouble(GetMember(normal, "Y"));
-                normalZ = ToDouble(GetMember(normal, "Z"));
-            }
-            else
-            {
-                // Запасной путь: нормаль = AxisX × AxisY.
-                var axisX = GetProperty(surface, "AxisX");
-                var axisY = GetProperty(surface, "AxisY");
-                if (axisX != null && axisY != null)
-                {
-                    double ax = ToDouble(GetMember(axisX, "X")), ay = ToDouble(GetMember(axisX, "Y")), az = ToDouble(GetMember(axisX, "Z"));
-                    double bx = ToDouble(GetMember(axisY, "X")), by = ToDouble(GetMember(axisY, "Y")), bz = ToDouble(GetMember(axisY, "Z"));
-                    normalX = ay * bz - az * by;
-                    normalY = az * bx - ax * bz;
-                    normalZ = ax * by - ay * bx;
-
-                    double length = Math.Sqrt(normalX * normalX + normalY * normalY + normalZ * normalZ);
-                    if (length > 1e-9)
-                    {
-                        normalX /= length; normalY /= length; normalZ /= length;
-                    }
-                    else
-                    {
-                        normalX = normalY = 0; normalZ = 1;
-                    }
-                }
+                log.Add("TopPart: получен через GetTopPart()");
+                return topPart;
             }
 
-            var partFace = new PartFace
+            object? document3D = GetProperty(_kompasApp, "ActiveDocument3D");
+            if (document3D == null) return null;
+
+            topPart = GetProperty(document3D, "TopPart");
+            if (topPart != null)
             {
-                Id = id,
-                Name = $"Грань #{id}",
-                Z = z,
-                NormalX = normalX,
-                NormalY = normalY,
-                NormalZ = normalZ
-            };
-
-            object? loops = GetProperty(face, "Loops");
-            int loopCount = GetCount(loops);
-
-            for (int loopIndex = 0; loopIndex < loopCount; loopIndex++)
-            {
-                object? loop = GetItem(loops, loopIndex);
-                if (loop == null) continue;
-
-                bool isOuter = loopIndex == 0;
-                object? outerFlag = GetProperty(loop, "IsOuter");
-                if (outerFlag is bool flag) isOuter = flag;
-
-                var partLoop = new PartLoop { IsOuter = isOuter };
-                object? edges = GetProperty(loop, "Edges");
-                int edgeCount = GetCount(edges);
-
-                for (int edgeIndex = 0; edgeIndex < edgeCount; edgeIndex++)
-                {
-                    object? edge = GetItem(edges, edgeIndex);
-                    var partEdge = ReadEdge(edge, 0, id);
-                    if (partEdge == null) continue;
-
-                    loopEdges.Add(partEdge);
-
-                    var sampled = GeometryMath.SampleEdge(partEdge);
-                    foreach (var point in sampled)
-                    {
-                        if (partLoop.Points.Count == 0 || !GeometryMath.SamePoint(partLoop.Points[partLoop.Points.Count - 1], point))
-                            partLoop.Points.Add(point);
-                    }
-                }
-
-                var normalized = GeometryMath.NormalizeLoop(partLoop.Points);
-                if (normalized.Count >= 3)
-                {
-                    partLoop.Points = normalized;
-                    partFace.Loops.Add(partLoop);
-                }
+                log.Add("TopPart: получен через ActiveDocument3D");
+                return topPart;
             }
 
-            if (partFace.Loops.Count == 0) return null;
+            topPart = InvokeMemberSafe(document3D, "GetPart", new object?[] { -1 })
+                      ?? InvokeMemberSafe(document3D, "GetPart", new object?[] { (short)-1 });
 
-            partFace.Area = GeometryMath.FaceArea(partFace);
-            return partFace;
+            if (topPart != null) log.Add("TopPart: получен через Document3D.GetPart(-1)");
+
+            return topPart;
         }
 
-        private PartEdge? ReadEdge(object? edge, int id, int faceId)
+        private void AppendDiagnostics(List<string> lines)
         {
-            if (edge == null) return null;
+            string text = string.Join(Environment.NewLine, lines);
+            LastDiagnostics = string.IsNullOrEmpty(LastDiagnostics)
+                ? text
+                : LastDiagnostics + Environment.NewLine + Environment.NewLine + text;
+        }
 
-            object? edgeGeometry = GetProperty(edge, "Geometry");
-            object? startPoint = GetProperty(edgeGeometry, "PointStart");
-            object? endPoint = GetProperty(edgeGeometry, "PointEnd");
+        /// <summary>Объекты заданного типа у элемента дерева построения (IFeature7::ModelObjects).</summary>
+        private static List<object> GetModelObjects(object part, int objType, List<string> log)
+        {
+            var result = new List<object>();
 
-            if (startPoint == null && endPoint == null) return null;
-
-            var start = ToPoint2D(startPoint ?? endPoint);
-            var end = ToPoint2D(endPoint ?? startPoint);
-
-            var partEdge = new PartEdge
+            foreach (string member in new[] { "ModelObjects", "GetModelObjects" })
             {
-                Id = id,
-                Name = $"Ребро #{id}",
+                object? raw = TryGetMember(part, member, new object?[] { objType }, log);
+                if (raw == null) raw = TryGetMember(part, member, new object?[] { (short)objType }, null);
+
+                foreach (object item in Flatten(raw))
+                {
+                    if (ReferenceEquals(item, part)) continue;
+                    result.Add(item);
+                }
+
+                if (result.Count > 0)
+                {
+                    log.Add($"{member}({objType}): {result.Count} объектов");
+                    return result;
+                }
+            }
+
+            log.Add("ModelObjects: коллекция объектов не получена");
+            return result;
+        }
+
+        /// <summary>
+        /// Читает плоскую горизонтальную грань. Наклонные и вертикальные грани отбрасываются:
+        /// для 2.5D-фрезерования по Z-уровням нужны только плоскости XY.
+        /// </summary>
+        private static PartFace? ReadHorizontalFace(
+            object faceObject,
+            int id,
+            Dictionary<string, PartEdge> edges,
+            out bool hasLoops)
+        {
+            var loopObjects = Flatten(TryGetMember(faceObject, "Loops", null, null)).ToList();
+            hasLoops = loopObjects.Count > 0;
+            if (loopObjects.Count == 0) return null;
+
+            var face = new PartFace { Id = id, Name = $"Грань #{id}" };
+            double minZ = double.MaxValue;
+            double maxZ = double.MinValue;
+            double zSum = 0;
+            int zCount = 0;
+
+            foreach (object loopObject in loopObjects)
+            {
+                if (!TryReadLoop(loopObject, id, edges, out List<Point3> points, out bool isOuter)) continue;
+
+                var flat = new List<TrochoidEngine.Point2D>(points.Count);
+                foreach (Point3 point in points)
+                {
+                    flat.Add(new TrochoidEngine.Point2D(point.X, point.Y));
+                    minZ = Math.Min(minZ, point.Z);
+                    maxZ = Math.Max(maxZ, point.Z);
+                    zSum += point.Z;
+                    zCount++;
+                }
+
+                var normalized = GeometryMath.NormalizeLoop(flat);
+                if (normalized.Count < 3) continue;
+
+                face.Loops.Add(new PartLoop { Points = normalized, IsOuter = isOuter });
+            }
+
+            if (face.Loops.Count == 0 || zCount == 0) return null;
+
+            // Все вершины грани должны лежать в одной плоскости XY.
+            if (maxZ - minZ > HorizontalTolerance) return null;
+
+            face.Z = zSum / zCount;
+
+            PartLoop outerLoop = face.Loops.FirstOrDefault(loop => loop.IsOuter) ?? face.Loops[0];
+            face.NormalZ = GeometryMath.SignedArea(outerLoop.Points) < 0 ? -1.0 : 1.0;
+            face.NormalX = 0;
+            face.NormalY = 0;
+            face.Area = GeometryMath.FaceArea(face);
+
+            string suffix = face.NormalZ > 0 ? "верх" : "низ";
+            face.Name = $"Грань #{id} · Z={face.Z:F2} ({suffix})";
+
+            return face;
+        }
+
+        private static bool TryReadLoop(
+            object loopObject,
+            int faceId,
+            Dictionary<string, PartEdge> edges,
+            out List<Point3> points,
+            out bool isOuter)
+        {
+            points = new List<Point3>();
+            isOuter = ToBool(TryGetMember(loopObject, "IsOuter", null, null), true);
+
+            var oriented = Flatten(TryGetMember(loopObject, "OrientedEdges", null, null)).ToList();
+            bool useOriented = oriented.Count > 0;
+            if (!useOriented) oriented = Flatten(TryGetMember(loopObject, "Edges", null, null)).ToList();
+
+            foreach (object item in oriented)
+            {
+                object? edgeObject = useOriented ? (TryGetMember(item, "Edge", null, null) ?? item) : item;
+                if (edgeObject == null) continue;
+
+                bool sameSense = !useOriented || ToBool(TryGetMember(item, "SameSense", null, null), true);
+
+                var edgePoints = ReadEdgePoints(edgeObject);
+                if (edgePoints.Count < 2) continue;
+
+                if (!sameSense) edgePoints.Reverse();
+
+                foreach (Point3 point in edgePoints) AppendDistinct(points, point);
+                RememberEdge(edges, edgePoints, faceId);
+            }
+
+            if (points.Count >= 3 && Distance2D(points[0], points[points.Count - 1]) < 1e-6)
+                points.RemoveAt(points.Count - 1);
+
+            return points.Count >= 3;
+        }
+
+        /// <summary>Точки ребра по порядку: вершины для отрезка, полигон кривой для дуги.</summary>
+        private static List<Point3> ReadEdgePoints(object edgeObject)
+        {
+            var points = new List<Point3>();
+
+            bool straight = ToBool(TryGetMember(edgeObject, "IsStraight", null, null), false);
+            bool curved = ToBool(TryGetMember(edgeObject, "IsArc", null, null), false)
+                          || ToBool(TryGetMember(edgeObject, "IsCircle", null, null), false)
+                          || ToBool(TryGetMember(edgeObject, "IsEllipse", null, null), false)
+                          || ToBool(TryGetMember(edgeObject, "IsEllipseArc", null, null), false)
+                          || ToBool(TryGetMember(edgeObject, "IsNurbs", null, null), false);
+
+            if (!straight || curved)
+            {
+                object? curve = TryGetMember(edgeObject, "MathCurve", null, null);
+                if (curve != null)
+                {
+                    // Шаг полигона 0.2 мм: дуги радиусом от 1 мм раскладываются достаточно точно.
+                    object? polygon = InvokeMemberSafe(curve, "CalculatePolygon", new object?[] { 0.2 });
+                    var sampled = ReadPointsArray(polygon);
+
+                    if (sampled.Count >= 2)
+                    {
+                        Point3? start = GetEdgeVertex(edgeObject, true);
+                        if (start.HasValue &&
+                            Distance(start.Value, sampled[0]) > Distance(start.Value, sampled[sampled.Count - 1]))
+                        {
+                            sampled.Reverse();
+                        }
+
+                        return sampled;
+                    }
+                }
+            }
+
+            Point3? first = GetEdgeVertex(edgeObject, true);
+            Point3? last = GetEdgeVertex(edgeObject, false);
+
+            if (first.HasValue) points.Add(first.Value);
+            if (last.HasValue) points.Add(last.Value);
+
+            return points;
+        }
+
+        private static Point3? GetEdgeVertex(object edgeObject, bool start)
+        {
+            // В разных версиях API параметр Start принимает bool либо 0/1.
+            object? vertex = TryGetMember(edgeObject, "Vertex", new object?[] { start }, null);
+            if (vertex == null) vertex = TryGetMember(edgeObject, "Vertex", new object?[] { start ? 1 : 0 }, null);
+
+            return GetVertexPoint(vertex);
+        }
+
+        /// <summary>IVertex::GetPoint отдаёт координаты через выходные параметры (by ref).</summary>
+        private static Point3? GetVertexPoint(object? vertex)
+        {
+            if (vertex == null) return null;
+
+            object?[] args = { 0.0, 0.0, 0.0 };
+            var modifiers = new ParameterModifier(3);
+            modifiers[0] = true;
+            modifiers[1] = true;
+            modifiers[2] = true;
+
+            try
+            {
+                vertex.GetType().InvokeMember(
+                    "GetPoint",
+                    BindingFlags.InvokeMethod | BindingFlags.Public | BindingFlags.Instance,
+                    null,
+                    vertex,
+                    args,
+                    new[] { modifiers },
+                    CultureInfo.InvariantCulture,
+                    null);
+
+                return new Point3(ToDouble(args[0]), ToDouble(args[1]), ToDouble(args[2]));
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void RememberEdge(Dictionary<string, PartEdge> edges, List<Point3> points, int faceId)
+        {
+            if (points.Count < 2) return;
+
+            Point3 first = points[0];
+            Point3 last = points[points.Count - 1];
+
+            string key = EdgeKey(first, last);
+            if (edges.ContainsKey(key)) return;
+
+            var edge = new PartEdge
+            {
+                Name = "Ребро",
                 Kind = PartCurveKind.Line,
-                Start = start,
-                End = end,
-                Z = ToDouble(GetMember(startPoint ?? endPoint, "Z")),
+                Start = new TrochoidEngine.Point2D(first.X, first.Y),
+                End = new TrochoidEngine.Point2D(last.X, last.Y),
+                Z = first.Z,
                 FaceId = faceId
             };
 
-            object? center = GetProperty(edgeGeometry, "Center");
-            object? radiusValue = GetProperty(edgeGeometry, "Radius");
-
-            if (center != null && radiusValue != null)
+            if (points.Count > 2 && TryFitCircle(points, out double cx, out double cy, out double radius))
             {
-                double radius = ToDouble(radiusValue);
-                if (radius > 1e-6)
-                {
-                    partEdge.Kind = PartCurveKind.Arc;
-                    partEdge.Center = ToPoint2D(center);
-                    partEdge.Radius = radius;
-                    partEdge.Clockwise = true;
+                edge.Kind = PartCurveKind.Arc;
+                edge.Center = new TrochoidEngine.Point2D(cx, cy);
+                edge.Radius = radius;
 
-                    double a0 = Math.Atan2(start.Y - partEdge.Center.Y, start.X - partEdge.Center.X);
-                    double a1 = Math.Atan2(end.Y - partEdge.Center.Y, end.X - partEdge.Center.X);
-                    double ccw = GeometryMath.NormalizeAngle(a1 - a0);
+                double a0 = Math.Atan2(edge.Start.Y - cy, edge.Start.X - cx);
+                double a1 = Math.Atan2(edge.End.Y - cy, edge.End.X - cx);
+                double spanCcw = GeometryMath.NormalizeAngle(a1 - a0);
 
-                    bool fullCircle = GeometryMath.SamePoint(start, end, 1e-3);
-                    if (fullCircle)
-                    {
-                        partEdge.Sweep = Math.PI * 2;
-                    }
-                    else if (ccw <= Math.PI)
-                    {
-                        // Кратчайшая дуга против часовой.
-                        partEdge.Clockwise = false;
-                        partEdge.Sweep = ccw;
-                    }
-                    else
-                    {
-                        // Кратчайшая дуга по часовой.
-                        partEdge.Clockwise = true;
-                        partEdge.Sweep = Math.PI * 2 - ccw;
-                    }
-                }
+                Point3 mid = points[points.Count / 2];
+                double midAngle = Math.Atan2(mid.Y - cy, mid.X - cx);
+                double midSpan = GeometryMath.NormalizeAngle(midAngle - a0);
+
+                bool ccw = midSpan < spanCcw;
+                edge.Clockwise = !ccw;
+                edge.Sweep = ccw ? spanCcw : Math.PI * 2 - spanCcw;
             }
 
-            return partEdge;
+            edges[key] = edge;
+        }
+
+        private static bool TryFitCircle(List<Point3> points, out double cx, out double cy, out double radius)
+        {
+            cx = 0;
+            cy = 0;
+            radius = 0;
+
+            if (points.Count < 3) return false;
+
+            Point3 a = points[0];
+            Point3 b = points[points.Count / 2];
+            Point3 c = points[points.Count - 1];
+
+            double d = 2 * (a.X * (b.Y - c.Y) + b.X * (c.Y - a.Y) + c.X * (a.Y - b.Y));
+            if (Math.Abs(d) < 1e-9) return false;
+
+            double a2 = a.X * a.X + a.Y * a.Y;
+            double b2 = b.X * b.X + b.Y * b.Y;
+            double c2 = c.X * c.X + c.Y * c.Y;
+
+            cx = (a2 * (b.Y - c.Y) + b2 * (c.Y - a.Y) + c2 * (a.Y - b.Y)) / d;
+            cy = (a2 * (c.X - b.X) + b2 * (a.X - c.X) + c2 * (b.X - a.X)) / d;
+            radius = Math.Sqrt((a.X - cx) * (a.X - cx) + (a.Y - cy) * (a.Y - cy));
+
+            return radius > 1e-3;
+        }
+
+        /// <summary>Плоский массив координат x1, y1, z1, x2, y2, z2, … → точки.</summary>
+        private static List<Point3> ReadPointsArray(object? value)
+        {
+            var points = new List<Point3>();
+            if (value is not Array array) return points;
+
+            var coordinates = new List<double>(array.Length);
+            foreach (object? item in array)
+            {
+                if (item == null) continue;
+                coordinates.Add(ToDouble(item));
+            }
+
+            for (int i = 0; i + 2 < coordinates.Count; i += 3)
+                points.Add(new Point3(coordinates[i], coordinates[i + 1], coordinates[i + 2]));
+
+            return points;
+        }
+
+        private static IEnumerable<object> Flatten(object? value)
+        {
+            if (value == null || value is string) yield break;
+
+            if (value is Array array && value is not double[])
+            {
+                foreach (object? item in array)
+                {
+                    if (item != null) yield return item;
+                }
+
+                yield break;
+            }
+
+            yield return value;
+        }
+
+        private static void AppendDistinct(List<Point3> points, Point3 point)
+        {
+            if (points.Count > 0 && Distance(points[points.Count - 1], point) < 1e-4) return;
+            points.Add(point);
+        }
+
+        private static double Distance(Point3 a, Point3 b)
+        {
+            double dx = a.X - b.X;
+            double dy = a.Y - b.Y;
+            double dz = a.Z - b.Z;
+            return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        private static double Distance2D(Point3 a, Point3 b)
+        {
+            double dx = a.X - b.X;
+            double dy = a.Y - b.Y;
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        /// <summary>Ключ ребра не зависит от направления обхода: одно ребро читается из двух граней.</summary>
+        private static string EdgeKey(Point3 a, Point3 b)
+        {
+            double ax = Math.Round(a.X, 3), ay = Math.Round(a.Y, 3), az = Math.Round(a.Z, 3);
+            double bx = Math.Round(b.X, 3), by = Math.Round(b.Y, 3), bz = Math.Round(b.Z, 3);
+
+            bool forward = ax < bx
+                           || (ax == bx && (ay < by || (ay == by && az <= bz)));
+
+            string head = FormattableString.Invariant($"{ax:F3},{ay:F3},{az:F3}");
+            string tail = FormattableString.Invariant($"{bx:F3},{by:F3},{bz:F3}");
+
+            return forward ? head + "|" + tail : tail + "|" + head;
+        }
+
+        private static object? TryGetMember(object? target, string member, object?[]? args, List<string>? log)
+        {
+            if (target == null) return null;
+
+            try
+            {
+                return target.GetType().InvokeMember(
+                    member,
+                    BindingFlags.GetProperty | BindingFlags.Public | BindingFlags.Instance,
+                    null,
+                    target,
+                    args);
+            }
+            catch (Exception ex)
+            {
+                log?.Add($"{member}: {DescribeException(ex)}");
+                return null;
+            }
+        }
+
+        private static object? InvokeMemberSafe(object? target, string member, object?[]? args)
+        {
+            if (target == null) return null;
+
+            try
+            {
+                return target.GetType().InvokeMember(
+                    member,
+                    BindingFlags.InvokeMethod | BindingFlags.Public | BindingFlags.Instance,
+                    null,
+                    target,
+                    args);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string DescribeException(Exception ex)
+        {
+            Exception inner = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;
+            return inner is COMException com ? $"0x{com.HResult:X8} {com.Message}" : inner.Message;
+        }
+
+        private static bool ToBool(object? value, bool fallback)
+        {
+            if (value == null) return fallback;
+            if (value is bool flag) return flag;
+
+            try { return Convert.ToInt32(value, CultureInfo.InvariantCulture) != 0; }
+            catch { return fallback; }
         }
 
         /// <summary>

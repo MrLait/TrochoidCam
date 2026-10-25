@@ -28,7 +28,7 @@
 
 **Что уже сделано в коде (25.10.2026):**
 
-- `KompasService.ReadPartGeometry` — чтение тел, плоских граней со всеми контурами и рёбер (отрезки/дуги); `RefreshGeometry` перечитывает активный документ;
+- `KompasService.ReadPartGeometry` — чтение по объектной модели API 7: `TopPart` → `IFeature7::ModelObjects(o3d_face)` → `IFace::Loops` → `ILoop7::OrientedEdges` → `IEdge::Vertex`; дуги раскладываются полигоном `IMathCurve3D::CalculatePolygon`. Берутся горизонтальные плоскости; `RefreshGeometry` перечитывает активный документ;
 - `KompasService.Connect` — CLSID по ProgID (`KOMPAS.Application.7/.6/.5`), обход Running Object Table, различение причин отказа (не установлен / не запущен / права / сессия) и отчёт `LastDiagnostics`;
 - `DemoGeometryFactory` — демо‑деталь для работы без КОМПАС;
 - `RegionCalculator` — область обработки по выбранным граням/рёбрам, площадь, глубина и объём;

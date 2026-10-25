@@ -217,7 +217,9 @@ namespace KompasTrochoidCam.ViewModels
             var geometry = _kompasService.ReadPartGeometry(out string message);
             if (geometry.IsEmpty)
             {
-                SetStatus(message, true);
+                // Подключение при этом успешное: красный цвет здесь означал бы «нет связи».
+                ConnectionStatus = message;
+                StatusColor = Brushes.DarkOrange;
                 return;
             }
 
